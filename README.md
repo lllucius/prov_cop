@@ -11,11 +11,11 @@ It has two parts:
    reader (and other AT) using semantic HTML, real `<label>`s,
    `aria-live` regions, and visible focus styles.
 
-2. **`esp32/Provisioner/`** — a drop-in Arduino library for ESP32 that
+2. **`esp32/provisioner/`** — a drop-in **ESP-IDF v6** component that
    sits in the background watching for the provisioning protocol on a
-   `Stream` (typically `Serial`). When valid credentials arrive, it
-   hands them to a callback in the main project and reports
-   success/failure back to the web page.
+   UART (typically the one wired to the on-board USB-serial bridge).
+   When valid credentials arrive, it hands them to a callback in the
+   main project and reports success/failure back to the web page.
 
 ## Using the web page
 
@@ -39,39 +39,55 @@ status region announces progress and the final result.
 
 ## Using the ESP32 component
 
-Copy the `esp32/Provisioner` folder into your Arduino `libraries/`
-directory (or your PlatformIO project's `lib/` folder) and add to your
-sketch:
+The component targets **ESP-IDF v6**. Add it to your project as a
+component (e.g. copy or symlink `esp32/provisioner/` into your project's
+`components/` directory, or reference it through
+`EXTRA_COMPONENT_DIRS`), then in your application:
 
-```cpp
-#include <Provisioner.h>
+```c
+#include "provisioner.h"
 
-Provisioner provisioner;
-
-bool onCreds(const String& ssid, const String& password) {
-  WiFi.begin(ssid.c_str(), password.c_str());
-  unsigned long t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) delay(250);
-  return WiFi.status() == WL_CONNECTED;
+static bool on_creds(const char *ssid, const char *password,
+                     char *err_out, size_t err_out_len, void *ctx) {
+    wifi_config_t wc = { 0 };
+    strlcpy((char *)wc.sta.ssid,     ssid,     sizeof wc.sta.ssid);
+    strlcpy((char *)wc.sta.password, password, sizeof wc.sta.password);
+    esp_wifi_set_config(WIFI_IF_STA, &wc);
+    esp_wifi_connect();
+    /* ...wait for IP_EVENT_STA_GOT_IP... */
+    return true;     // -> <<PROV:OK>>; return false for <<PROV:ERR ...>>
 }
 
-void setup() {
-  Serial.begin(115200);
-  provisioner.begin(Serial, onCreds);
-}
-
-void loop() {
-  provisioner.poll();   // non-blocking
-  // ... your app ...
+void app_main(void) {
+    provisioner_uart_config_t cfg = PROVISIONER_UART_CONFIG_DEFAULT();
+    cfg.on_credentials = on_creds;
+    ESP_ERROR_CHECK(provisioner_start_uart(&cfg, NULL));
 }
 ```
 
-A complete sketch is in
-[`esp32/Provisioner/examples/Basic/Basic.ino`](esp32/Provisioner/examples/Basic/Basic.ino).
+A complete project is in
+[`esp32/provisioner/examples/basic/`](esp32/provisioner/examples/basic/):
+
+```sh
+cd esp32/provisioner/examples/basic
+idf.py set-target esp32
+idf.py build flash monitor
+```
+
+Defaults (UART port, baud, task stack/priority) are set through
+`menuconfig` under **Provisioner**.
 
 The component only reacts to lines that begin with `<<` and look like
-its own framed messages, so it co-exists peacefully with `Serial.print`
-debug output from the rest of your project.
+its own framed messages, so it co-exists peacefully with `ESP_LOGx`
+output from the rest of your project on the same UART.
+
+> **Note on UART sharing.** On most ESP32 boards UART0 is wired to the
+> on-board USB-serial bridge — that is what the web page connects to.
+> The default IDF console also uses UART0. If you want the provisioner
+> to install the UART driver itself, set `CONFIG_ESP_CONSOLE_NONE=y` or
+> `CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y` in `menuconfig` so the console
+> does not claim it. Otherwise pick a dedicated UART (e.g. `UART_NUM_1`
+> with explicit pins) for the provisioner.
 
 ## Wire protocol
 
@@ -117,11 +133,15 @@ for `<<PROV:OK>>` or `<<PROV:ERR ...>>`.
 ## Repository layout
 
 ```
-index.html                       Provisioning web page
-esp32/Provisioner/
-  library.properties             Arduino library manifest
-  keywords.txt                   Arduino IDE syntax colouring
-  src/Provisioner.h              Public API
-  src/Provisioner.cpp            Implementation
-  examples/Basic/Basic.ino       Minimal demo sketch
+index.html                                 Provisioning web page
+esp32/provisioner/                         ESP-IDF v6 component
+  CMakeLists.txt                           idf_component_register
+  Kconfig                                  menuconfig defaults
+  idf_component.yml                        Component manifest
+  include/provisioner.h                    Public C API
+  src/provisioner.c                        Implementation
+  examples/basic/                          Standalone example project
+    CMakeLists.txt
+    main/CMakeLists.txt
+    main/main.c
 ```
