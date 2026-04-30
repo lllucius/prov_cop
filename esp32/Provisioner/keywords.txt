@@ -1,0 +1,17 @@
+#######################################
+# Syntax Coloring Map for Provisioner
+#######################################
+
+#######################################
+# Datatypes (KEYWORD1)
+#######################################
+Provisioner	KEYWORD1
+CredentialsCallback	KEYWORD1
+
+#######################################
+# Methods and Functions (KEYWORD2)
+#######################################
+begin	KEYWORD2
+poll	KEYWORD2
+setQuiet	KEYWORD2
+setDefaultFailureReason	KEYWORD2
