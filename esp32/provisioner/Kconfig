@@ -1,0 +1,29 @@
+menu "Provisioner"
+
+    config PROVISIONER_DEFAULT_UART_NUM
+        int "Default UART port"
+        range 0 2
+        default 0
+        help
+            UART port used by PROVISIONER_UART_CONFIG_DEFAULT(). On most
+            ESP32 dev boards, UART0 is wired to the on-board USB-serial
+            adapter, which is what the companion web page connects to.
+
+    config PROVISIONER_DEFAULT_BAUD_RATE
+        int "Default baud rate"
+        default 115200
+        help
+            Baud rate used by PROVISIONER_UART_CONFIG_DEFAULT(). Must match
+            what the web page opens the port with (the web page uses 115200).
+
+    config PROVISIONER_DEFAULT_TASK_STACK
+        int "Default background task stack size (bytes)"
+        default 4096
+        range 2048 16384
+
+    config PROVISIONER_DEFAULT_TASK_PRIORITY
+        int "Default background task priority"
+        default 5
+        range 1 24
+
+endmenu

@@ -1,0 +1,538 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ESP32 Wi-Fi Provisioner</title>
+<style>
+  :root {
+    --fg: #111;
+    --bg: #fff;
+    --muted: #555;
+    --accent: #0b5fff;
+    --ok: #0a7a2f;
+    --err: #b00020;
+    --border: #555;
+    --focus: #ffbf00;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --fg: #f1f1f1;
+      --bg: #111;
+      --muted: #c8c8c8;
+      --accent: #6aa6ff;
+      --ok: #6ee089;
+      --err: #ff8a8a;
+      --border: #c8c8c8;
+    }
+  }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+    color: var(--fg);
+    background: var(--bg);
+    line-height: 1.5;
+    font-size: 1.05rem;
+  }
+  main {
+    max-width: 44rem;
+    margin: 0 auto;
+    padding: 1.5rem 1rem 3rem;
+  }
+  h1 { font-size: 1.6rem; margin: 0 0 0.5rem; }
+  h2 { font-size: 1.2rem; margin: 1.5rem 0 0.5rem; }
+  p  { margin: 0.5rem 0; }
+  .lede { color: var(--muted); }
+  fieldset {
+    border: 2px solid var(--border);
+    border-radius: 6px;
+    padding: 1rem 1rem 1.25rem;
+    margin: 1rem 0;
+  }
+  legend { font-weight: bold; padding: 0 0.4rem; }
+  label {
+    display: block;
+    font-weight: bold;
+    margin-top: 0.75rem;
+  }
+  .hint {
+    display: block;
+    font-weight: normal;
+    color: var(--muted);
+    font-size: 0.95rem;
+    margin-top: 0.15rem;
+  }
+  input[type="text"],
+  input[type="password"] {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 0.55rem 0.6rem;
+    margin-top: 0.35rem;
+    font: inherit;
+    color: var(--fg);
+    background: var(--bg);
+    border: 2px solid var(--border);
+    border-radius: 4px;
+  }
+  input[type="checkbox"] { width: 1.1rem; height: 1.1rem; }
+  .checkbox-row {
+    margin-top: 0.5rem;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-weight: normal;
+  }
+  .checkbox-row label { font-weight: normal; margin: 0; }
+  button {
+    font: inherit;
+    padding: 0.6rem 1rem;
+    margin: 0.25rem 0.5rem 0.25rem 0;
+    border: 2px solid var(--border);
+    border-radius: 4px;
+    background: var(--bg);
+    color: var(--fg);
+    cursor: pointer;
+  }
+  button.primary {
+    background: var(--accent);
+    color: #fff;
+    border-color: var(--accent);
+  }
+  button[disabled] { opacity: 0.55; cursor: not-allowed; }
+  :focus-visible {
+    outline: 3px solid var(--focus);
+    outline-offset: 2px;
+  }
+  .status, .alert {
+    margin: 1rem 0;
+    padding: 0.75rem 1rem;
+    border: 2px solid var(--border);
+    border-radius: 4px;
+  }
+  .status { background: rgba(0, 120, 0, 0.06); }
+  .alert  { background: rgba(176, 0, 32, 0.08); border-color: var(--err); color: var(--err); }
+  .status strong { color: var(--ok); }
+  .visually-hidden {
+    position: absolute !important;
+    width: 1px; height: 1px;
+    padding: 0; margin: -1px;
+    overflow: hidden; clip: rect(0 0 0 0);
+    white-space: nowrap; border: 0;
+  }
+  details { margin: 1rem 0; }
+  summary { cursor: pointer; font-weight: bold; }
+  code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    background: rgba(127,127,127,0.15);
+    padding: 0.05rem 0.3rem;
+    border-radius: 3px;
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>ESP32 Wi-Fi Provisioner</h1>
+  <p class="lede">
+    Use this page to send a Wi-Fi network name (SSID) and password to an ESP32 board
+    that is plugged into this computer over USB. The values are sent only to the
+    selected serial device. Nothing is uploaded to the internet.
+  </p>
+
+  <div id="support" class="alert" role="alert" hidden>
+    <strong>Your browser does not support Web Serial.</strong>
+    Please use a recent version of Google Chrome or Microsoft Edge on a desktop
+    computer, and open this page over <code>https://</code> or from
+    <code>http://localhost</code>.
+  </div>
+
+  <h2>Step 1 of 3: Plug in the ESP32</h2>
+  <p>
+    Connect the ESP32 board to this computer with its USB cable.
+    Close any other program that might be using the board, such as the Arduino
+    Serial Monitor.
+  </p>
+
+  <h2>Step 2 of 3: Enter Wi-Fi details</h2>
+  <form id="prov-form" novalidate>
+    <fieldset>
+      <legend>Wi-Fi network</legend>
+
+      <label for="ssid">
+        Network name (SSID)
+        <span class="hint" id="ssid-hint">
+          The exact name of your Wi-Fi network. Maximum 32 characters.
+        </span>
+      </label>
+      <input
+        type="text"
+        id="ssid"
+        name="ssid"
+        autocomplete="off"
+        autocapitalize="off"
+        spellcheck="false"
+        maxlength="32"
+        required
+        aria-describedby="ssid-hint"
+        aria-required="true">
+
+      <label for="password">
+        Password
+        <span class="hint" id="password-hint">
+          The Wi-Fi password. Leave blank only if the network is open. Maximum 63 characters.
+        </span>
+      </label>
+      <input
+        type="password"
+        id="password"
+        name="password"
+        autocomplete="off"
+        autocapitalize="off"
+        spellcheck="false"
+        maxlength="63"
+        aria-describedby="password-hint">
+
+      <div class="checkbox-row">
+        <input type="checkbox" id="show-password">
+        <label for="show-password">Show password</label>
+      </div>
+    </fieldset>
+
+    <h2>Step 3 of 3: Send to ESP32</h2>
+    <p>
+      When you select <strong>Send to ESP32</strong>, your browser will ask which
+      serial device to use. Choose the ESP32 board from the list and select
+      <strong>Connect</strong>.
+    </p>
+
+    <button type="submit" id="send-btn" class="primary">
+      Send to ESP32
+    </button>
+    <button type="button" id="cancel-btn" disabled>
+      Cancel
+    </button>
+  </form>
+
+  <h2>Status</h2>
+  <div
+    id="status"
+    class="status"
+    role="status"
+    aria-live="polite"
+    aria-atomic="true">
+    Ready. Fill in the Wi-Fi details above and select <strong>Send to ESP32</strong>.
+  </div>
+  <div
+    id="alert"
+    class="alert"
+    role="alert"
+    aria-live="assertive"
+    aria-atomic="true"
+    hidden></div>
+
+  <details>
+    <summary>How this works (for curious users and developers)</summary>
+    <p>
+      This page uses the <strong>Web Serial API</strong> to talk to the ESP32 at
+      115200 baud, 8 data bits, no parity, 1 stop bit. It speaks a small text
+      protocol:
+    </p>
+    <ul>
+      <li>Browser sends <code>&lt;&lt;PROV?&gt;&gt;</code> repeatedly to get the board's attention.</li>
+      <li>ESP32 replies <code>&lt;&lt;PROV!&gt;&gt;</code> when ready.</li>
+      <li>Browser sends <code>&lt;&lt;PROV:SET ssid_b64 pass_b64 crc16&gt;&gt;</code>.</li>
+      <li>ESP32 replies <code>&lt;&lt;PROV:OK&gt;&gt;</code> on success or <code>&lt;&lt;PROV:ERR <em>reason</em>&gt;&gt;</code> on failure.</li>
+    </ul>
+    <p>
+      The SSID and password are Base64 encoded so any characters are transmitted
+      safely, and a CRC-16/CCITT-FALSE checksum protects against line noise.
+    </p>
+  </details>
+</main>
+
+<script>
+"use strict";
+
+(function () {
+  // ---- Protocol constants ----------------------------------------------------
+  const BAUD            = 115200;
+  const PROBE           = "<<PROV?>>\n";
+  const READY_RE        = /<<PROV!>>/;
+  const RESULT_RE       = /<<PROV:(OK|ERR(?:\s+([^>]*))?)>>/;
+  const PROBE_INTERVAL  = 500;  // ms
+  const ATTENTION_TIMEO = 8000; // ms total to get a READY
+  const RESULT_TIMEO    = 30000; // ms to wait for OK/ERR after SET
+
+  // ---- DOM -------------------------------------------------------------------
+  const $ = (id) => document.getElementById(id);
+  const supportEl = $("support");
+  const form      = $("prov-form");
+  const ssidEl    = $("ssid");
+  const passEl    = $("password");
+  const showPass  = $("show-password");
+  const sendBtn   = $("send-btn");
+  const cancelBtn = $("cancel-btn");
+  const statusEl  = $("status");
+  const alertEl   = $("alert");
+
+  if (!("serial" in navigator)) {
+    supportEl.hidden = false;
+    sendBtn.disabled = true;
+  }
+
+  showPass.addEventListener("change", () => {
+    passEl.type = showPass.checked ? "text" : "password";
+  });
+
+  function setStatus(text) {
+    // textContent prevents any HTML injection from device-supplied error tokens
+    statusEl.textContent = text;
+  }
+  function clearAlert() {
+    alertEl.hidden = true;
+    alertEl.textContent = "";
+  }
+  function setAlert(text) {
+    alertEl.textContent = text;
+    alertEl.hidden = false;
+  }
+
+  // ---- Encoding helpers ------------------------------------------------------
+  function utf8ToBase64(str) {
+    const bytes = new TextEncoder().encode(str);
+    let bin = "";
+    for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return btoa(bin);
+  }
+  function crc16ccitt(str) {
+    // CRC-16/CCITT-FALSE: poly 0x1021, init 0xFFFF, no reflection, no xorout
+    let crc = 0xFFFF;
+    for (let i = 0; i < str.length; i++) {
+      crc ^= (str.charCodeAt(i) & 0xFF) << 8;
+      for (let b = 0; b < 8; b++) {
+        crc = (crc & 0x8000) ? ((crc << 1) ^ 0x1021) : (crc << 1);
+        crc &= 0xFFFF;
+      }
+    }
+    return crc.toString(16).toUpperCase().padStart(4, "0");
+  }
+
+  // ---- Serial session --------------------------------------------------------
+  let session = null;  // { port, reader, writer, abort, buffer }
+
+  async function openPort() {
+    let port;
+    try {
+      port = await navigator.serial.requestPort();
+    } catch (e) {
+      // User cancelled the chooser, or no device.
+      throw new Error("No serial device was selected.");
+    }
+    await port.open({
+      baudRate: BAUD,
+      dataBits: 8,
+      stopBits: 1,
+      parity:   "none",
+      flowControl: "none",
+    });
+    return port;
+  }
+
+  async function closeSession() {
+    if (!session) return;
+    const s = session;
+    session = null;
+    try { s.abort.abort(); } catch (_) {}
+    try { if (s.reader) await s.reader.cancel(); } catch (_) {}
+    try { if (s.reader) s.reader.releaseLock(); } catch (_) {}
+    try { if (s.writer) s.writer.releaseLock(); } catch (_) {}
+    try { await s.port.close(); } catch (_) {}
+  }
+
+  function makeSession(port) {
+    const writer = port.writable.getWriter();
+    const reader = port.readable.getReader();
+    const decoder = new TextDecoder();
+    const abort = new AbortController();
+    const s = { port, reader, writer, abort, buffer: "" };
+    return s;
+  }
+
+  async function sendLine(s, line) {
+    const data = new TextEncoder().encode(line);
+    await s.writer.write(data);
+  }
+
+  // Reads from the port and resolves when matchRe matches the accumulated
+  // buffer. Rejects on timeout or abort. Returns the regex match.
+  function waitForMatch(s, matchRe, timeoutMs) {
+    return new Promise((resolve, reject) => {
+      let timer = setTimeout(() => {
+        cleanup();
+        reject(new Error("timeout"));
+      }, timeoutMs);
+
+      const onAbort = () => {
+        cleanup();
+        reject(new Error("cancelled"));
+      };
+      s.abort.signal.addEventListener("abort", onAbort, { once: true });
+
+      function cleanup() {
+        clearTimeout(timer);
+        s.abort.signal.removeEventListener("abort", onAbort);
+      }
+
+      // First, see if the existing buffer already contains a match.
+      const existing = matchRe.exec(s.buffer);
+      if (existing) {
+        // Trim consumed portion so further calls don't re-match.
+        s.buffer = s.buffer.slice(existing.index + existing[0].length);
+        cleanup();
+        resolve(existing);
+        return;
+      }
+
+      const decoder = new TextDecoder();
+
+      (async function pump() {
+        try {
+          while (true) {
+            const { value, done } = await s.reader.read();
+            if (done) {
+              cleanup();
+              reject(new Error("serial port closed"));
+              return;
+            }
+            if (value && value.byteLength) {
+              s.buffer += decoder.decode(value, { stream: true });
+              // Cap buffer size to protect against runaway input.
+              if (s.buffer.length > 8192) {
+                s.buffer = s.buffer.slice(-4096);
+              }
+              const m = matchRe.exec(s.buffer);
+              if (m) {
+                s.buffer = s.buffer.slice(m.index + m[0].length);
+                cleanup();
+                resolve(m);
+                return;
+              }
+            }
+          }
+        } catch (e) {
+          cleanup();
+          reject(e);
+        }
+      })();
+    });
+  }
+
+  // ---- Main flow -------------------------------------------------------------
+  async function provision(ssid, password) {
+    clearAlert();
+    setStatus("Asking for permission to use the serial device...");
+    const port = await openPort();
+    session = makeSession(port);
+    sendBtn.disabled   = true;
+    cancelBtn.disabled = false;
+
+    try {
+      // Attention phase: send probes until we see READY, or time out.
+      setStatus("Connected to serial device. Trying to get the ESP32's attention...");
+      const probeStart = Date.now();
+      let readyMatch = null;
+      while (Date.now() - probeStart < ATTENTION_TIMEO) {
+        await sendLine(session, PROBE);
+        try {
+          readyMatch = await waitForMatch(session, READY_RE, PROBE_INTERVAL);
+          break;
+        } catch (e) {
+          if (e.message === "cancelled" || e.message === "serial port closed") throw e;
+          // Otherwise it was a per-probe timeout: send another probe.
+        }
+      }
+      if (!readyMatch) {
+        throw new Error(
+          "The ESP32 did not respond. Check that the board is plugged in, " +
+          "running the provisioning firmware, and not opened by another program."
+        );
+      }
+
+      // Send credentials.
+      setStatus("ESP32 is ready. Sending Wi-Fi details...");
+      const ssidB64 = utf8ToBase64(ssid);
+      const passB64 = utf8ToBase64(password);
+      const crc     = crc16ccitt(ssidB64 + " " + passB64);
+      const setLine = "<<PROV:SET " + ssidB64 + " " + passB64 + " " + crc + ">>\n";
+      await sendLine(session, setLine);
+
+      // Wait for result.
+      setStatus("Waiting for the ESP32 to confirm...");
+      const result = await waitForMatch(session, RESULT_RE, RESULT_TIMEO);
+      const kind   = result[1];   // "OK" or "ERR ..."
+      if (kind === "OK") {
+        setStatus("Success. The ESP32 accepted the Wi-Fi details.");
+      } else {
+        const reason = (result[2] || "").trim() || "unknown";
+        throw new Error("The ESP32 reported a failure: " + reason);
+      }
+    } finally {
+      await closeSession();
+      sendBtn.disabled   = false;
+      cancelBtn.disabled = true;
+    }
+  }
+
+  // ---- Form handling ---------------------------------------------------------
+  form.addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    clearAlert();
+
+    if (!("serial" in navigator)) {
+      setAlert("Web Serial is not available in this browser.");
+      return;
+    }
+
+    const ssid = ssidEl.value.trim();
+    const pass = passEl.value;  // do not trim; passwords may have spaces
+
+    if (!ssid) {
+      setAlert("Please enter the Wi-Fi network name (SSID).");
+      ssidEl.focus();
+      return;
+    }
+    if (ssid.length > 32) {
+      setAlert("The SSID must be 32 characters or fewer.");
+      ssidEl.focus();
+      return;
+    }
+    if (pass.length > 63) {
+      setAlert("The password must be 63 characters or fewer.");
+      passEl.focus();
+      return;
+    }
+
+    try {
+      await provision(ssid, pass);
+    } catch (err) {
+      setStatus("Stopped.");
+      setAlert(err && err.message ? err.message : String(err));
+      // Move focus to the alert so JAWS users land on the failure message.
+      alertEl.tabIndex = -1;
+      alertEl.focus();
+    }
+  });
+
+  cancelBtn.addEventListener("click", async () => {
+    setStatus("Cancelling...");
+    await closeSession();
+    sendBtn.disabled   = false;
+    cancelBtn.disabled = true;
+    setStatus("Cancelled. You can try again.");
+  });
+
+  // Best-effort cleanup if the user closes the tab mid-session.
+  window.addEventListener("beforeunload", () => { closeSession(); });
+})();
+</script>
+</body>
+</html>

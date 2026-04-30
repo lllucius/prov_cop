@@ -1,0 +1,22 @@
+## IDF Component Manager manifest
+##
+## Place this component anywhere ESP-IDF looks for components, or reference
+## it from another project's idf_component.yml as a `path:` dependency.
+
+version: "1.0.0"
+description: "Drop-in Wi-Fi provisioning component over USB serial for ESP32 boards. Companion to the prov_cop Web Serial provisioning page."
+url: "https://github.com/lllucius/prov_cop"
+license: "MIT"
+
+dependencies:
+  idf:
+    version: ">=6.0,<7.0"
+
+targets:
+  - esp32
+  - esp32s2
+  - esp32s3
+  - esp32c3
+  - esp32c6
+  - esp32h2
+  - esp32p4
