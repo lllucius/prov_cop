@@ -339,6 +339,8 @@
   const RELOAD_NOTICE_KEY = "prov_reload_notice";
   const RELOAD_SSID_KEY   = "prov_reload_ssid";
   const RELOAD_PASS_KEY   = "prov_reload_pass";
+  const PREFLIGHT_RELOAD_KEY = "prov_preflight_reload";
+  let skipPreflightReload = false;
 
   // Log buffer cap: trim from the front when the on-page log grows past this
   // many characters, to avoid unbounded memory / DOM growth on long sessions.
@@ -349,6 +351,7 @@
     sendBtn.disabled = true;
   }
   restorePostReloadNotice();
+  handlePreflightReload();
 
   showPass.addEventListener("change", () => {
     passEl.type = showPass.checked ? "text" : "password";
@@ -396,6 +399,23 @@
     } catch (_) {
       // Ignore storage failures (private mode/policy); UX still works.
     }
+  }
+
+
+  function handlePreflightReload() {
+    try {
+      if (sessionStorage.getItem(PREFLIGHT_RELOAD_KEY) !== "1") return;
+      sessionStorage.removeItem(PREFLIGHT_RELOAD_KEY);
+      skipPreflightReload = true;
+      const savedSsid = sessionStorage.getItem(RELOAD_SSID_KEY) || "";
+      const savedPass = sessionStorage.getItem(RELOAD_PASS_KEY) || "";
+      sessionStorage.removeItem(RELOAD_SSID_KEY);
+      sessionStorage.removeItem(RELOAD_PASS_KEY);
+      if (savedSsid) ssidEl.value = savedSsid;
+      if (savedPass) passEl.value = savedPass;
+      setStatus("Browser refreshed. Continuing provisioning...");
+      setTimeout(() => { form.requestSubmit(); }, 0);
+    } catch (_) {}
   }
 
   // ---- Encoding helpers ------------------------------------------------------
@@ -968,6 +988,17 @@
     if (utf8ByteLength(pass) > 63) {
       setAlert("The password must be 63 UTF-8 bytes or fewer.");
       passEl.focus();
+      return;
+    }
+
+    if (!skipPreflightReload) {
+      try {
+        sessionStorage.setItem(PREFLIGHT_RELOAD_KEY, "1");
+        sessionStorage.setItem(RELOAD_SSID_KEY, ssid);
+        sessionStorage.setItem(RELOAD_PASS_KEY, pass);
+      } catch (_) {}
+      setStatus("Refreshing browser before opening Web Serial...");
+      setTimeout(() => { window.location.reload(); }, 50);
       return;
     }
 
