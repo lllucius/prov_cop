@@ -893,6 +893,19 @@
     }
   }
 
+
+  function reloadPageSoon(reason) {
+    setStatus(reason + " Refreshing the page to reset Web Serial state...");
+    setTimeout(() => {
+      try {
+        window.location.reload();
+      } catch (_) {
+        // Fallback (equivalent full navigation to same URL).
+        window.location.href = window.location.href;
+      }
+    }, 800);
+  }
+
   // ---- Form handling ---------------------------------------------------------
   form.addEventListener("submit", async (ev) => {
     ev.preventDefault();
@@ -941,6 +954,12 @@
         // Move focus to the alert so JAWS users land on the failure message.
         alertEl.tabIndex = -1;
         alertEl.focus();
+
+        // If Chromium still thinks the handle is open, a full page reload
+        // is the most reliable recovery (equivalent to pressing F5).
+        if (/already open/i.test(msg)) {
+          reloadPageSoon("The serial port is still marked open.");
+        }
       }
     } finally {
       busy = false;
