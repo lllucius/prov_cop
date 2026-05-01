@@ -990,8 +990,8 @@
     try {
       await provision(ssid, pass);
     } catch (e) {
-      if (e.message !== RELOAD_SENTINEL) {
-        setAlert(e.message || String(e));
+      if (!e || e.message !== RELOAD_SENTINEL) {
+        setAlert((e && e.message) || String(e));
       }
     } finally {
       busy = false;
