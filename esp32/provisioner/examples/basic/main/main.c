@@ -25,29 +25,33 @@
 
 #include "provisioner.h"
 
-static const char *TAG = "prov_basic";
+static const char* TAG = "prov_basic";
 
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
 
 static EventGroupHandle_t s_wifi_events;
-static int                s_retries;
-static const int          s_retry_max = 5;
+static int s_retries;
+static const int s_retry_max = 5;
 
-static void wifi_event_handler(void *arg, esp_event_base_t base,
-                               int32_t id, void *data)
+static void wifi_event_handler(void* arg, esp_event_base_t base, int32_t id, void* data)
 {
-    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
-        if (s_retries < s_retry_max) {
+    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED)
+    {
+        if (s_retries < s_retry_max)
+        {
             esp_wifi_connect();
             s_retries++;
-            ESP_LOGI(TAG, "retrying Wi-Fi connect (%d/%d)",
-                     s_retries, s_retry_max);
-        } else {
+            ESP_LOGI(TAG, "retrying Wi-Fi connect (%d/%d)", s_retries, s_retry_max);
+        }
+        else
+        {
             xEventGroupSetBits(s_wifi_events, WIFI_FAIL_BIT);
         }
-    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
-        ip_event_got_ip_t *e = (ip_event_got_ip_t *)data;
+    }
+    else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP)
+    {
+        ip_event_got_ip_t* e = (ip_event_got_ip_t*)data;
         ESP_LOGI(TAG, "got IP " IPSTR, IP2STR(&e->ip_info.ip));
         s_retries = 0;
         xEventGroupSetBits(s_wifi_events, WIFI_CONNECTED_BIT);
@@ -57,7 +61,10 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
 static void wifi_init_once(void)
 {
     static bool inited;
-    if (inited) return;
+    if (inited)
+    {
+        return;
+    }
     inited = true;
 
     ESP_ERROR_CHECK(esp_netif_init());
@@ -67,10 +74,16 @@ static void wifi_init_once(void)
     wifi_init_config_t wic = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&wic));
 
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(
-        WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(
-        IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
+                                                        ESP_EVENT_ANY_ID,
+                                                        &wifi_event_handler,
+                                                        NULL,
+                                                        NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
+                                                        IP_EVENT_STA_GOT_IP,
+                                                        &wifi_event_handler,
+                                                        NULL,
+                                                        NULL));
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
@@ -78,47 +91,49 @@ static void wifi_init_once(void)
     s_wifi_events = xEventGroupCreate();
 }
 
-static bool on_credentials(const char *ssid, const char *password,
-                           char *err_out, size_t err_out_len, void *ctx)
+static bool
+on_credentials(const char* ssid, const char* password, char* err_out, size_t err_out_len, void* ctx)
 {
     (void)ctx;
     ESP_LOGI(TAG, "received credentials, ssid=\"%s\"", ssid);
 
     wifi_init_once();
 
-    wifi_config_t wc = { 0 };
-    strlcpy((char *)wc.sta.ssid,     ssid,     sizeof wc.sta.ssid);
-    strlcpy((char *)wc.sta.password, password, sizeof wc.sta.password);
-    wc.sta.threshold.authmode =
-        (password[0] == '\0') ? WIFI_AUTH_OPEN : WIFI_AUTH_WPA2_PSK;
+    wifi_config_t wc = {0};
+    strlcpy((char*)wc.sta.ssid, ssid, sizeof wc.sta.ssid);
+    strlcpy((char*)wc.sta.password, password, sizeof wc.sta.password);
+    wc.sta.threshold.authmode = (password[0] == '\0') ? WIFI_AUTH_OPEN : WIFI_AUTH_WPA2_PSK;
 
     s_retries = 0;
     xEventGroupClearBits(s_wifi_events, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
 
-    if (esp_wifi_set_config(WIFI_IF_STA, &wc) != ESP_OK ||
-        esp_wifi_disconnect() != ESP_OK ||
-        esp_wifi_connect() != ESP_OK) {
+    if (esp_wifi_set_config(WIFI_IF_STA, &wc) != ESP_OK || esp_wifi_disconnect() != ESP_OK ||
+        esp_wifi_connect() != ESP_OK)
+    {
         strlcpy(err_out, "wifi_api", err_out_len);
         return false;
     }
 
-    EventBits_t bits = xEventGroupWaitBits(
-        s_wifi_events, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
-        pdTRUE, pdFALSE, pdMS_TO_TICKS(20000));
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_events,
+                                           WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+                                           pdTRUE,
+                                           pdFALSE,
+                                           pdMS_TO_TICKS(20000));
 
-    if (bits & WIFI_CONNECTED_BIT) return true;
+    if (bits & WIFI_CONNECTED_BIT)
+    {
+        return true;
+    }
 
-    strlcpy(err_out,
-            (bits & WIFI_FAIL_BIT) ? "auth_or_unreachable" : "timeout",
-            err_out_len);
+    strlcpy(err_out, (bits & WIFI_FAIL_BIT) ? "auth_or_unreachable" : "timeout", err_out_len);
     return false;
 }
 
 void app_main(void)
 {
     esp_err_t err = nvs_flash_init();
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES ||
-        err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND)
+    {
         ESP_ERROR_CHECK(nvs_flash_erase());
         ESP_ERROR_CHECK(nvs_flash_init());
     }

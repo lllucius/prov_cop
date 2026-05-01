@@ -79,12 +79,13 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "esp_err.h"
 #include "driver/uart.h"
+#include "esp_err.h"
 #include "sdkconfig.h"
 
 #ifdef __cplusplus
-extern "C" {
+extern "C"
+{
 #endif
 
 /**
@@ -101,14 +102,14 @@ extern "C" {
  * @return  true on success (browser sees `<<PROV:OK>>`),
  *          false on failure (browser sees `<<PROV:ERR <reason>>>`).
  */
-typedef bool (*provisioner_credentials_cb_t)(const char *ssid,
-                                             const char *password,
-                                             char *err_out,
+typedef bool (*provisioner_credentials_cb_t)(const char* ssid,
+                                             const char* password,
+                                             char* err_out,
                                              size_t err_out_len,
-                                             void *user_ctx);
+                                             void* user_ctx);
 
 /** Opaque handle to a running provisioner instance. */
-typedef struct provisioner *provisioner_handle_t;
+typedef struct provisioner* provisioner_handle_t;
 
 /**
  * Configuration for the UART convenience entry point.
@@ -116,54 +117,55 @@ typedef struct provisioner *provisioner_handle_t;
  * Use PROVISIONER_UART_CONFIG_DEFAULT() to start with sensible defaults,
  * then fill in the callback (and any pin overrides).
  */
-typedef struct {
-    uart_port_t uart_num;          /**< UART port to use (e.g. UART_NUM_0). */
-    int         tx_pin;            /**< TX pin, or UART_PIN_NO_CHANGE.      */
-    int         rx_pin;            /**< RX pin, or UART_PIN_NO_CHANGE.      */
-    int         rts_pin;           /**< RTS pin, or UART_PIN_NO_CHANGE.     */
-    int         cts_pin;           /**< CTS pin, or UART_PIN_NO_CHANGE.     */
-    int         baud_rate;         /**< Baud rate (default 115200).         */
-    bool        install_driver;    /**< If true, install the UART driver;
-                                        if false, assume it is already
-                                        installed (e.g. by the console).   */
-    size_t      rx_buffer_size;    /**< UART RX ring buffer (bytes).        */
-    size_t      tx_buffer_size;    /**< UART TX ring buffer (bytes), 0 for
-                                        blocking writes.                    */
-    int         task_priority;     /**< FreeRTOS task priority.             */
-    size_t      task_stack_size;   /**< FreeRTOS task stack (bytes).        */
-    int         task_core_id;      /**< Core to pin task to, or
-                                        tskNO_AFFINITY (-1).                */
+typedef struct
+{
+    uart_port_t uart_num;                        /**< UART port to use (e.g. UART_NUM_0). */
+    int tx_pin;                                  /**< TX pin, or UART_PIN_NO_CHANGE.      */
+    int rx_pin;                                  /**< RX pin, or UART_PIN_NO_CHANGE.      */
+    int rts_pin;                                 /**< RTS pin, or UART_PIN_NO_CHANGE.     */
+    int cts_pin;                                 /**< CTS pin, or UART_PIN_NO_CHANGE.     */
+    int baud_rate;                               /**< Baud rate (default 115200).         */
+    bool install_driver;                         /**< If true, install the UART driver;
+                                                      if false, assume it is already
+                                                      installed (e.g. by the console).   */
+    size_t rx_buffer_size;                       /**< UART RX ring buffer (bytes).        */
+    size_t tx_buffer_size;                       /**< UART TX ring buffer (bytes), 0 for
+                                                      blocking writes.                    */
+    int task_priority;                           /**< FreeRTOS task priority.             */
+    size_t task_stack_size;                      /**< FreeRTOS task stack (bytes).        */
+    int task_core_id;                            /**< Core to pin task to, or
+                                                      tskNO_AFFINITY (-1).                */
     provisioner_credentials_cb_t on_credentials; /**< Required.             */
-    void       *user_ctx;          /**< Opaque pointer passed to callback.  */
-    bool        share_with_console;/**< If true, sniff `<<PROV...>>` frames
-                                        out of the byte stream and forward
-                                        everything else to `stdin` so the
-                                        IDF console can keep using the same
-                                        UART. Implies `install_driver=true`
-                                        and that no other code installs or
-                                        reads the UART driver. See header
-                                        comments for details.            */
+    void* user_ctx;                              /**< Opaque pointer passed to callback.  */
+    bool share_with_console;                     /**< If true, sniff `<<PROV...>>` frames
+                                                      out of the byte stream and forward
+                                                      everything else to `stdin` so the
+                                                      IDF console can keep using the same
+                                                      UART. Implies `install_driver=true`
+                                                      and that no other code installs or
+                                                      reads the UART driver. See header
+                                                      comments for details.            */
 } provisioner_uart_config_t;
 
 /** Static initializer with safe defaults (fill in `on_credentials`). */
-#define PROVISIONER_UART_CONFIG_DEFAULT()                                \
-    ((provisioner_uart_config_t){                                        \
-        .uart_num        = (uart_port_t)CONFIG_PROVISIONER_DEFAULT_UART_NUM, \
-        .tx_pin          = UART_PIN_NO_CHANGE,                           \
-        .rx_pin          = UART_PIN_NO_CHANGE,                           \
-        .rts_pin         = UART_PIN_NO_CHANGE,                           \
-        .cts_pin         = UART_PIN_NO_CHANGE,                           \
-        .baud_rate       = CONFIG_PROVISIONER_DEFAULT_BAUD_RATE,         \
-        .install_driver  = true,                                         \
-        .rx_buffer_size  = 1024,                                         \
-        .tx_buffer_size  = 0,                                            \
-        .task_priority   = CONFIG_PROVISIONER_DEFAULT_TASK_PRIORITY,     \
-        .task_stack_size = CONFIG_PROVISIONER_DEFAULT_TASK_STACK,        \
-        .task_core_id    = -1,                                           \
-        .on_credentials  = NULL,                                         \
-        .user_ctx        = NULL,                                         \
-        .share_with_console = false,                                     \
-    })
+#define PROVISIONER_UART_CONFIG_DEFAULT()                                                          \
+((provisioner_uart_config_t){                                                                  \
+    .uart_num = (uart_port_t)CONFIG_PROVISIONER_DEFAULT_UART_NUM,                              \
+    .tx_pin = UART_PIN_NO_CHANGE,                                                              \
+    .rx_pin = UART_PIN_NO_CHANGE,                                                              \
+    .rts_pin = UART_PIN_NO_CHANGE,                                                             \
+    .cts_pin = UART_PIN_NO_CHANGE,                                                             \
+    .baud_rate = CONFIG_PROVISIONER_DEFAULT_BAUD_RATE,                                         \
+    .install_driver = true,                                                                    \
+    .rx_buffer_size = 1024,                                                                    \
+    .tx_buffer_size = 0,                                                                       \
+    .task_priority = CONFIG_PROVISIONER_DEFAULT_TASK_PRIORITY,                                 \
+    .task_stack_size = CONFIG_PROVISIONER_DEFAULT_TASK_STACK,                                  \
+    .task_core_id = -1,                                                                        \
+    .on_credentials = NULL,                                                                    \
+    .user_ctx = NULL,                                                                          \
+    .share_with_console = false,                                                               \
+})
 
 /**
  * Start the provisioner: install (or attach to) the given UART, spawn a
@@ -176,8 +178,8 @@ typedef struct {
  *
  * @return ESP_OK on success, or an esp_err_t describing the failure.
  */
-esp_err_t provisioner_start_uart(const provisioner_uart_config_t *cfg,
-                                 provisioner_handle_t *out);
+esp_err_t provisioner_start_uart(const provisioner_uart_config_t* cfg,
+                                 provisioner_handle_t* out);
 
 /**
  * Stop a previously started provisioner. Joins its task, releases any
