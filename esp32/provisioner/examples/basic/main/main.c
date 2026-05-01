@@ -107,8 +107,20 @@ on_credentials(const char* ssid, const char* password, char* err_out, size_t err
     s_retries = 0;
     xEventGroupClearBits(s_wifi_events, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
 
-    if (esp_wifi_set_config(WIFI_IF_STA, &wc) != ESP_OK || esp_wifi_disconnect() != ESP_OK ||
-        esp_wifi_connect() != ESP_OK)
+    esp_err_t err = esp_wifi_set_config(WIFI_IF_STA, &wc);
+    if (err == ESP_OK)
+    {
+        err = esp_wifi_disconnect();
+        if (err == ESP_ERR_WIFI_NOT_CONNECT)
+        {
+            err = ESP_OK;
+        }
+    }
+    if (err == ESP_OK)
+    {
+        err = esp_wifi_connect();
+    }
+    if (err != ESP_OK)
     {
         strlcpy(err_out, "wifi_api", err_out_len);
         return false;
