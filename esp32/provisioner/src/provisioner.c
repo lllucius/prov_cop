@@ -33,7 +33,9 @@ static const char* TAG = "provisioner";
 
 // VFS base path used when share_with_console is enabled. We only support a
 // single shared instance at a time (there is just one stdin to redirect).
-#define PROV_VFS_BASE_PATH "/dev/prov_console"
+// Must be <= 15 chars (ESP_VFS_PATH_MAX-1) and contain no embedded '/' beyond
+// the leading one or esp_vfs_register() returns ESP_ERR_INVALID_ARG.
+#define PROV_VFS_BASE_PATH "/prov_console"
 // Size of the buffer that holds bytes destined for the redirected stdin.
 // 512 bytes comfortably exceeds typical console line lengths (incl. paste
 // of a long command) so a brief stall in the consumer does not lose data.
