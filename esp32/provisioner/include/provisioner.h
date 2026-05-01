@@ -9,6 +9,7 @@
 //
 //   Web -> ESP   <<PROV?>>
 //   ESP -> Web   <<PROV!>>
+//   ESP -> Web   <<PROV:ID <name_b64>>>           (optional, see device_name)
 //   Web -> ESP   <<PROV:SET <ssid_b64> <pass_b64> <crc16_hex>>>
 //   ESP -> Web   <<PROV:OK>>
 //   ESP -> Web   <<PROV:ERR <reason>>>
@@ -17,6 +18,12 @@
 // no xorout) computed over the ASCII string "<ssid_b64> <pass_b64>"
 // (the two base64 strings joined by exactly one space). pass_b64 may be
 // empty for an open Wi-Fi network.
+//
+// If the firmware sets `device_name`, the probe response is followed by an
+// extra line `<<PROV:ID <name_b64>>>` whose payload is the base64 encoding
+// of the configured human-readable name, so the web page can show the
+// user *which* device is being provisioned. Older browsers that don't
+// recognise the `:ID` line ignore it.
 // Base64 and CRC are transport framing only, not secrecy or authentication;
 // treat provisioning as a local serial-access operation.
 //
@@ -132,7 +139,11 @@ typedef struct
                                                       installed (e.g. by the console).   */
     size_t rx_buffer_size;                       /**< UART RX ring buffer (bytes).        */
     size_t tx_buffer_size;                       /**< UART TX ring buffer (bytes), 0 for
-                                                      blocking writes.                    */
+                                                      blocking writes. Auto-promoted to
+                                                      at least 256 bytes when
+                                                      `share_with_console` is true so
+                                                      log output through the driver
+                                                      cannot block the UART consumer. */
     int task_priority;                           /**< FreeRTOS task priority.             */
     size_t task_stack_size;                      /**< FreeRTOS task stack (bytes).        */
     int task_core_id;                            /**< Core to pin task to, or
@@ -144,9 +155,19 @@ typedef struct
                                                       everything else to `stdin` so the
                                                       IDF console can keep using the same
                                                       UART. Implies `install_driver=true`
-                                                      and that no other code installs or
-                                                      reads the UART driver. See header
-                                                      comments for details.            */
+                                                      (auto-promoted) and that no other
+                                                      code installs or reads the UART
+                                                      driver. See header comments for
+                                                      details.                           */
+    /**
+     * Optional NUL-terminated human-readable device name (e.g. "Kitchen
+     * Caller ID"). When set, the firmware advertises it to the web page
+     * after a probe via `<<PROV:ID <name_b64>>>`, so the user can see
+     * which device they are provisioning. May be NULL or "" to omit. The
+     * pointer must remain valid for the lifetime of the provisioner.
+     * Names longer than 64 bytes are silently truncated.
+     */
+    const char* device_name;
 } provisioner_uart_config_t;
 
 /** Static initializer with safe defaults (fill in `on_credentials`). */
@@ -167,6 +188,7 @@ typedef struct
     .on_credentials = NULL,                                                                    \
     .user_ctx = NULL,                                                                          \
     .share_with_console = false,                                                               \
+    .device_name = NULL,                                                                       \
 })
 
 /**

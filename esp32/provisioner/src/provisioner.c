@@ -1,15 +1,18 @@
 // provisioner.c - see provisioner.h for documentation.
+//
+// This file is the ESP-IDF integration layer. The actual protocol parser
+// lives in provisioner_proto.[ch] and is transport-agnostic so it can be
+// unit-tested on a host. This file wires the parser to a UART driver and
+// (optionally) a redirected stdin VFS.
 
 #include "provisioner.h"
 
-#include <ctype.h>
 #include <errno.h>
-#include <fcntl.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <unistd.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -21,30 +24,18 @@
 #include "esp_check.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_vfs.h"
-#include "mbedtls/base64.h"
+
+#include "provisioner_proto.h"
 
 static const char* TAG = "provisioner";
 
-// Maximum size of one inbound line. SET line with two base64-encoded
-// strings (max ~44 + ~88 chars) plus framing easily fits in 320 bytes.
-#define PROV_LINE_MAX 320
-
-// 802.11 limits.
-#define PROV_MAX_SSID_LEN 32
-#define PROV_MAX_PASS_LEN 63
-
-// Frame strings.
-static const char PROV_PROBE[] = "<<PROV?>>";
-static const char PROV_READY[] = "<<PROV!>>\n";
-static const char PROV_SET_PFX[] = "<<PROV:SET ";
-static const char PROV_OK[] = "<<PROV:OK>>\n";
-static const char PROV_ERR_PFX[] = "<<PROV:ERR ";
-static const char PROV_ERR_SFX[] = ">>\n";
-
 // VFS base path used when share_with_console is enabled. We only support a
 // single shared instance at a time (there is just one stdin to redirect).
-#define PROV_VFS_BASE_PATH "/dev/prov_console"
+// Must be <= 15 chars (ESP_VFS_PATH_MAX-1) and contain no embedded '/' beyond
+// the leading one or esp_vfs_register() returns ESP_ERR_INVALID_ARG.
+#define PROV_VFS_BASE_PATH "/prov_console"
 // Size of the buffer that holds bytes destined for the redirected stdin.
 // 512 bytes comfortably exceeds typical console line lengths (incl. paste
 // of a long command) so a brief stall in the consumer does not lose data.
@@ -59,461 +50,99 @@ static const char PROV_ERR_SFX[] = ">>\n";
 // Maximum time provisioner_stop() waits for the background task or redirected
 // stdin readers to quiesce before returning ESP_ERR_TIMEOUT.
 #define PROV_STOP_TIMEOUT_MS 30000
-
-// State machine for sharing the byte stream with the console.
-enum prov_share_state
-{
-    PSS_LINE_START = 0, // start of a line; no bytes accumulated yet
-    PSS_GOT_ONE_LT,     // saw a single '<' at line start
-    PSS_BUFFER_FRAME,   // accumulating a possible "<<...>>" frame
-    PSS_PASSTHROUGH,    // forwarding bytes verbatim until next '\n'
-};
+// Minimum interval between successive `<<PROV!>>` probe responses, to
+// rate-limit a flood of probes that would otherwise saturate the shared
+// console UART. The browser's normal probe cadence is 500 ms so 200 ms
+// keeps that fully responsive while still capping pathological floods.
+#define PROV_PROBE_MIN_INTERVAL_MS 200
 
 struct provisioner
 {
     provisioner_uart_config_t cfg; // copy of caller's config
-    TaskHandle_t task;
-    SemaphoreHandle_t task_done;
-    bool stop;
-    bool task_stopped;
-    bool installed_driver;
-    char line[PROV_LINE_MAX];
-    size_t line_len;
-    bool overflow;
-    enum prov_share_state share_state;
+    TaskHandle_t              task;
+    SemaphoreHandle_t         task_done;
+    atomic_bool               stop;
+    bool                      task_stopped;
+    bool                      installed_driver;
+    bool                      uart_vfs_redirected;
+
+    prov_proto_t proto;
 
     // Console-sharing state. Only used when cfg.share_with_console is true.
     StreamBufferHandle_t stdin_stream;
-    SemaphoreHandle_t stdin_lock;
-    int stdin_readers;
-    bool stdin_closing;
-    bool vfs_registered;
-    int saved_stdin_fd; // -1 if no redirection
+    SemaphoreHandle_t    stdin_lock;
+    int                  stdin_readers;
+    atomic_bool          stdin_closing;
+    bool                 vfs_registered;
+    bool                 stdin_redirected;
 };
 
 // Single shared instance pointer used by the VFS callbacks.
 static struct provisioner* s_share_instance;
 
 // ---------------------------------------------------------------------------
-// CRC-16/CCITT-FALSE
+// Protocol -> UART glue
 // ---------------------------------------------------------------------------
-static uint16_t prov_crc16(const char* data, size_t len)
+static void prov_uart_write_cb(void* ctx, const char* data, size_t len)
 {
-    uint16_t crc = 0xFFFF;
-    for (size_t i = 0; i < len; i++)
+    struct provisioner* p = (struct provisioner*)ctx;
+    if (len == 0)
     {
-        crc ^= ((uint16_t)(uint8_t)data[i]) << 8;
-        for (int b = 0; b < 8; b++)
-        {
-            crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021) : (uint16_t)(crc << 1);
-        }
+        return;
     }
-    return crc;
+    uart_write_bytes(p->cfg.uart_num, data, len);
 }
 
-// ---------------------------------------------------------------------------
-// I/O helpers
-// ---------------------------------------------------------------------------
-static void prov_write(struct provisioner* p, const char* s)
+static void prov_uart_forward_cb(void* ctx, const char* data, size_t len)
 {
-    uart_write_bytes(p->cfg.uart_num, s, strlen(s));
-}
-
-static void prov_send_err(struct provisioner* p, const char* reason)
-{
-    // Sanitise: tokens must not contain spaces, '>', or NL.
-    char buf[48];
-    size_t n = 0;
-    for (const char* r = reason; *r && n + 1 < sizeof buf; r++)
-    {
-        char c = *r;
-        if (c == ' ' || c == '>' || c == '\r' || c == '\n')
-        {
-            c = '_';
-        }
-        buf[n++] = c;
-    }
-    buf[n] = '\0';
-    if (n == 0)
-    {
-        strcpy(buf, "fail");
-    }
-    uart_write_bytes(p->cfg.uart_num, PROV_ERR_PFX, sizeof(PROV_ERR_PFX) - 1);
-    uart_write_bytes(p->cfg.uart_num, buf, strlen(buf));
-    uart_write_bytes(p->cfg.uart_num, PROV_ERR_SFX, sizeof(PROV_ERR_SFX) - 1);
-}
-
-// ---------------------------------------------------------------------------
-// Base64 decode (mbedtls). Returns true on success and writes a NUL-terminated
-// string into `out` (size out_size, including NUL). Empty input yields "".
-// ---------------------------------------------------------------------------
-static bool prov_b64_decode(const char* in,
-                            size_t in_len,
-                            char* out,
-                            size_t out_size,
-                            size_t* written_out)
-{
-    if (written_out)
-    {
-        *written_out = 0;
-    }
-    if (in_len == 0)
-    {
-        if (out_size == 0)
-        {
-            return false;
-        }
-        out[0] = '\0';
-        return true;
-    }
-    if (out_size == 0)
-    {
-        return false;
-    }
-    size_t written = 0;
-    int rc = mbedtls_base64_decode((unsigned char*)out,
-                                   out_size - 1,
-                                   &written,
-                                   (const unsigned char*)in,
-                                   in_len);
-    if (rc != 0)
-    {
-        return false;
-    }
-    if (memchr(out, '\0', written) != NULL)
-    {
-        return false;
-    }
-    out[written] = '\0';
-    if (written_out)
-    {
-        *written_out = written;
-    }
-    return true;
-}
-
-// ---------------------------------------------------------------------------
-// Protocol handling
-// ---------------------------------------------------------------------------
-static void prov_handle_set(struct provisioner* p, const char* args)
-{
-    // args = "ssid_b64 pass_b64 crc16hex" (pass_b64 may be empty).
-    // We split on the two known spaces.
-    const char* s1 = strchr(args, ' ');
-    if (!s1)
-    {
-        prov_send_err(p, "fields");
-        return;
-    }
-    const char* s2 = strchr(s1 + 1, ' ');
-    if (!s2)
-    {
-        prov_send_err(p, "fields");
-        return;
-    }
-    if (strchr(s2 + 1, ' ') != NULL)
-    {
-        prov_send_err(p, "fields");
-        return;
-    }
-
-    size_t ssid_b64_len = (size_t)(s1 - args);
-    size_t pass_b64_len = (size_t)(s2 - (s1 + 1));
-    const char* crc_str = s2 + 1;
-
-    // CRC over "ssid_b64 pass_b64".
-    if (strlen(crc_str) != 4)
-    {
-        prov_send_err(p, "crc");
-        return;
-    }
-    uint16_t want = prov_crc16(args, (size_t)(s2 - args));
-    uint16_t got = 0;
-    for (int i = 0; i < 4; i++)
-    {
-        char c = crc_str[i];
-        uint8_t v;
-        if (c >= '0' && c <= '9')
-        {
-            v = (uint8_t)(c - '0');
-        }
-        else if (c >= 'A' && c <= 'F')
-        {
-            v = (uint8_t)(10 + c - 'A');
-        }
-        else if (c >= 'a' && c <= 'f')
-        {
-            v = (uint8_t)(10 + c - 'a');
-        }
-        else
-        {
-            prov_send_err(p, "crc");
-            return;
-        }
-        got = (uint16_t)((got << 4) | v);
-    }
-    if (got != want)
-    {
-        prov_send_err(p, "crc");
-        return;
-    }
-
-    char ssid[PROV_MAX_SSID_LEN + 1];
-    char pass[PROV_MAX_PASS_LEN + 1];
-    size_t ssid_len = 0;
-    size_t pass_len = 0;
-
-    if (!prov_b64_decode(args, ssid_b64_len, ssid, sizeof ssid, &ssid_len))
-    {
-        prov_send_err(p, "b64ssid");
-        return;
-    }
-    if (!prov_b64_decode(s1 + 1, pass_b64_len, pass, sizeof pass, &pass_len))
-    {
-        prov_send_err(p, "b64pass");
-        return;
-    }
-
-    if (ssid_len == 0 || ssid_len > PROV_MAX_SSID_LEN || pass_len > PROV_MAX_PASS_LEN)
-    {
-        prov_send_err(p, "length");
-        return;
-    }
-
-    if (!p->cfg.on_credentials)
-    {
-        prov_send_err(p, "nocallback");
-        return;
-    }
-
-    char err_buf[32] = {0};
-    bool ok = p->cfg.on_credentials(ssid, pass, err_buf, sizeof err_buf, p->cfg.user_ctx);
-
-    // Wipe local copies of the password before logging anything.
-    volatile char* vp = (volatile char*)pass;
-    for (size_t i = 0; i < sizeof pass; i++)
-    {
-        vp[i] = 0;
-    }
-
-    if (ok)
-    {
-        prov_write(p, PROV_OK);
-        ESP_LOGI(TAG, "credentials accepted (ssid=\"%s\")", ssid);
-    }
-    else
-    {
-        const char* reason = err_buf[0] ? err_buf : "callback";
-        prov_send_err(p, reason);
-        ESP_LOGW(TAG, "credentials rejected: %s", reason);
-    }
-}
-
-static bool prov_handle_line(struct provisioner* p, char* line, size_t len)
-{
-    // Only consider lines that look like our framing: "<<PROV...>>".
-    // Returns true if the line was a recognised provisioner frame and was
-    // consumed; false if the line should be passed through to the
-    // console (or simply discarded when not sharing).
-    if (len < 5 || line[0] != '<' || line[1] != '<')
-    {
-        return false;
-    }
-
-    if (len == sizeof(PROV_PROBE) - 1 && memcmp(line, PROV_PROBE, len) == 0)
-    {
-        prov_write(p, PROV_READY);
-        return true;
-    }
-
-    size_t pfx = sizeof(PROV_SET_PFX) - 1;
-    if (len > pfx + 2 && memcmp(line, PROV_SET_PFX, pfx) == 0 && line[len - 1] == '>' &&
-        line[len - 2] == '>')
-    {
-        line[len - 2] = '\0';
-        prov_handle_set(p, line + pfx);
-        return true;
-    }
-    // Other framed lines are not ours.
-    return false;
-}
-
-// ---------------------------------------------------------------------------
-// Console-sharing helpers
-// ---------------------------------------------------------------------------
-static void prov_forward(struct provisioner* p, const char* data, size_t n)
-{
-    // Forward bytes to the redirected stdin if console sharing is enabled,
-    // otherwise drop them (preserves the historical "discard non-frame
-    // traffic" behaviour).
-    if (!p->cfg.share_with_console || !p->stdin_stream || n == 0)
+    struct provisioner* p = (struct provisioner*)ctx;
+    if (!p->stdin_stream || len == 0)
     {
         return;
     }
     // Non-blocking-ish push: if the consumer hasn't drained the buffer we
     // wait briefly, then drop the overflow rather than stalling the UART
     // reader (which would also stall any in-flight provisioning frame).
-    xStreamBufferSend(p->stdin_stream, data, n, pdMS_TO_TICKS(PROV_STDIN_SEND_TIMEOUT_MS));
+    xStreamBufferSend(p->stdin_stream, data, len, pdMS_TO_TICKS(PROV_STDIN_SEND_TIMEOUT_MS));
 }
 
-static void prov_forward_byte(struct provisioner* p, char c)
+static uint32_t prov_now_ms_cb(void)
 {
-    prov_forward(p, &c, 1);
+    return (uint32_t)(esp_timer_get_time() / 1000);
 }
 
-static void prov_feed(struct provisioner* p, const uint8_t* buf, size_t n)
+// Wrapper that adapts the user's provisioner_credentials_cb_t to the
+// protocol layer's prov_proto_credentials_cb_t. The two share an identical
+// signature today; the wrapper exists so we control logging & sanitisation
+// at one well-defined point.
+static bool prov_credentials_trampoline(const char* ssid,
+                                        const char* password,
+                                        char*       err_out,
+                                        size_t      err_out_len,
+                                        void*       user_ctx)
 {
-    // When sharing is disabled this collapses to the original behaviour:
-    // every byte is funnelled into p->line until '\n', then the line is
-    // examined and either acted on or silently dropped.
-    //
-    // When sharing is enabled we run a tiny state machine that buffers
-    // only candidate "<<..." frame openers; any byte that cannot be the
-    // start of one of our frames is forwarded to the console immediately,
-    // preserving interactive responsiveness for non-line-buffered
-    // consumers (e.g. linenoise).
-    const bool share = p->cfg.share_with_console;
-
-    for (size_t i = 0; i < n; i++)
+    struct provisioner* p = (struct provisioner*)user_ctx;
+    if (!p->cfg.on_credentials)
     {
-        char c = (char)buf[i];
-
-        if (!share)
-        {
-            // Original path: '\r' stripped, accumulate until '\n', then
-            // try to interpret. Anything else is dropped.
-            if (c == '\r')
-            {
-                continue;
-            }
-            if (c == '\n')
-            {
-                if (p->overflow)
-                {
-                    p->line_len = 0;
-                    p->overflow = false;
-                    continue;
-                }
-                p->line[p->line_len] = '\0';
-                (void)prov_handle_line(p, p->line, p->line_len);
-                p->line_len = 0;
-                continue;
-            }
-            if (p->line_len + 1 >= sizeof p->line)
-            {
-                p->overflow = true;
-                continue;
-            }
-            p->line[p->line_len++] = c;
-            continue;
-        }
-
-        // ---- shared mode ----
-        switch (p->share_state)
-        {
-            case PSS_LINE_START:
-                if (c == '<')
-                {
-                    p->line[0] = c;
-                    p->line_len = 1;
-                    p->share_state = PSS_GOT_ONE_LT;
-                }
-                else if (c == '\n')
-                {
-                    prov_forward_byte(p, c);
-                    // stay in PSS_LINE_START
-                }
-                else
-                {
-                    prov_forward_byte(p, c);
-                    p->share_state = PSS_PASSTHROUGH;
-                }
-                break;
-
-            case PSS_GOT_ONE_LT:
-                if (c == '<')
-                {
-                    p->line[1] = c;
-                    p->line_len = 2;
-                    p->overflow = false;
-                    p->share_state = PSS_BUFFER_FRAME;
-                }
-                else if (c == '\n')
-                {
-                    // "<\n" -- not a frame, flush.
-                    prov_forward(p, p->line, p->line_len);
-                    prov_forward_byte(p, c);
-                    p->line_len = 0;
-                    p->share_state = PSS_LINE_START;
-                }
-                else
-                {
-                    prov_forward(p, p->line, p->line_len);
-                    prov_forward_byte(p, c);
-                    p->line_len = 0;
-                    p->share_state = PSS_PASSTHROUGH;
-                }
-                break;
-
-            case PSS_BUFFER_FRAME:
-                if (c == '\r')
-                {
-                    // Match the historical behaviour: '\r' inside a frame is
-                    // stripped so that CRLF and LF both work.
-                    break;
-                }
-                if (c == '\n')
-                {
-                    if (p->overflow)
-                    {
-                        // Buffered prefix already flushed; just emit the '\n'
-                        // and reset.
-                        prov_forward_byte(p, c);
-                        p->line_len = 0;
-                        p->overflow = false;
-                        p->share_state = PSS_LINE_START;
-                        break;
-                    }
-                    p->line[p->line_len] = '\0';
-                    bool consumed = prov_handle_line(p, p->line, p->line_len);
-                    if (!consumed)
-                    {
-                        // Not one of ours; replay the line to the console.
-                        prov_forward(p, p->line, p->line_len);
-                        prov_forward_byte(p, '\n');
-                    }
-                    p->line_len = 0;
-                    p->share_state = PSS_LINE_START;
-                    break;
-                }
-                if (p->line_len + 1 >= sizeof p->line)
-                {
-                    // Frame too long to be ours -- flush what we have and
-                    // pass the rest through.
-                    if (!p->overflow)
-                    {
-                        prov_forward(p, p->line, p->line_len);
-                        p->overflow = true;
-                    }
-                    prov_forward_byte(p, c);
-                    p->share_state = PSS_PASSTHROUGH;
-                    break;
-                }
-                p->line[p->line_len++] = c;
-                break;
-
-            case PSS_PASSTHROUGH:
-            default:
-                prov_forward_byte(p, c);
-                if (c == '\n')
-                {
-                    p->line_len = 0;
-                    p->overflow = false;
-                    p->share_state = PSS_LINE_START;
-                }
-                break;
-        }
+        return false;
     }
+    bool ok =
+        p->cfg.on_credentials(ssid, password, err_out, err_out_len, p->cfg.user_ctx);
+    // Avoid logging the SSID verbatim: it is attacker-controllable input
+    // arriving on the same UART as the log sink, so a hostile peer could
+    // otherwise inject terminal escape sequences (or crafted bytes) into
+    // a serial monitor or log aggregator. Log only the length, which is
+    // useful for diagnostics but not exploitable.
+    if (ok)
+    {
+        ESP_LOGI(TAG, "credentials accepted (ssid_len=%u)", (unsigned)strlen(ssid));
+    }
+    else
+    {
+        const char* reason = (err_out && err_out[0]) ? err_out : "callback";
+        ESP_LOGW(TAG, "credentials rejected: %s", reason);
+    }
+    return ok;
 }
 
 // ---------------------------------------------------------------------------
@@ -522,19 +151,19 @@ static void prov_feed(struct provisioner* p, const uint8_t* buf, size_t n)
 static void prov_task(void* arg)
 {
     struct provisioner* p = (struct provisioner*)arg;
-    uint8_t buf[128];
+    uint8_t             buf[128];
 
     ESP_LOGI(TAG,
              "provisioner task running on UART%d @ %d",
              (int)p->cfg.uart_num,
              p->cfg.baud_rate);
 
-    while (!p->stop)
+    while (!atomic_load(&p->stop))
     {
         int n = uart_read_bytes(p->cfg.uart_num, buf, sizeof buf, pdMS_TO_TICKS(100));
         if (n > 0)
         {
-            prov_feed(p, buf, (size_t)n);
+            prov_proto_feed(&p->proto, buf, (size_t)n);
         }
         else if (n < 0)
         {
@@ -558,8 +187,6 @@ static int prov_vfs_open(void* ctx, const char* path, int flags, int mode)
     struct provisioner* p = (struct provisioner*)ctx;
     (void)flags;
     (void)mode;
-    // We expose a single device "/0" under our base path. Anything else
-    // is rejected.
     if (path == NULL)
     {
         return -1;
@@ -578,10 +205,7 @@ static int prov_vfs_open(void* ctx, const char* path, int flags, int mode)
         errno = ENODEV;
         return -1;
     }
-    xSemaphoreTake(p->stdin_lock, portMAX_DELAY);
-    bool closing = p->stdin_closing;
-    xSemaphoreGive(p->stdin_lock);
-    if (closing)
+    if (atomic_load(&p->stdin_closing))
     {
         errno = ENODEV;
         return -1;
@@ -601,27 +225,39 @@ static ssize_t prov_vfs_read(void* ctx, int fd, void* dst, size_t size)
     {
         return 0;
     }
-    xSemaphoreTake(p->stdin_lock, portMAX_DELAY);
-    if (p->stdin_closing)
+    if (atomic_load(&p->stdin_closing))
     {
-        xSemaphoreGive(p->stdin_lock);
         return 0;
     }
+
+    // Track that a reader is in-flight so teardown can wait for us to
+    // finish before deleting the underlying stream buffer / mutex.
+    xSemaphoreTake(p->stdin_lock, portMAX_DELAY);
     p->stdin_readers++;
     xSemaphoreGive(p->stdin_lock);
 
     size_t got = 0;
     while (got == 0)
     {
-        got = xStreamBufferReceive(p->stdin_stream, dst, size, pdMS_TO_TICKS(PROV_STDIN_READ_POLL_MS));
-        if (got > 0)
+        // FreeRTOS stream buffers are SPSC: serialize the actual receive
+        // call across (rare) concurrent readers, but release the lock
+        // between iterations so teardown can observe counter changes
+        // promptly.
+        xSemaphoreTake(p->stdin_lock, portMAX_DELAY);
+        bool closing = atomic_load(&p->stdin_closing);
+        if (!closing)
+        {
+            got = xStreamBufferReceive(p->stdin_stream,
+                                       dst,
+                                       size,
+                                       pdMS_TO_TICKS(PROV_STDIN_READ_POLL_MS));
+        }
+        xSemaphoreGive(p->stdin_lock);
+        if (got > 0 || closing)
         {
             break;
         }
-        xSemaphoreTake(p->stdin_lock, portMAX_DELAY);
-        bool closing = p->stdin_closing;
-        xSemaphoreGive(p->stdin_lock);
-        if (closing)
+        if (atomic_load(&p->stdin_closing))
         {
             break;
         }
@@ -680,8 +316,8 @@ static esp_err_t prov_console_share_setup(struct provisioner* p)
         return ESP_ERR_INVALID_STATE;
     }
 
-    p->saved_stdin_fd = -1;
-    p->stdin_lock = xSemaphoreCreateMutex();
+    p->stdin_redirected = false;
+    p->stdin_lock       = xSemaphoreCreateMutex();
     if (p->stdin_lock == NULL)
     {
         return ESP_ERR_NO_MEM;
@@ -695,9 +331,9 @@ static esp_err_t prov_console_share_setup(struct provisioner* p)
     }
 
     static const esp_vfs_t vfs = {
-        .flags = ESP_VFS_FLAG_CONTEXT_PTR,
-        .open_p = prov_vfs_open,
-        .read_p = prov_vfs_read,
+        .flags   = ESP_VFS_FLAG_CONTEXT_PTR,
+        .open_p  = prov_vfs_open,
+        .read_p  = prov_vfs_read,
         .close_p = prov_vfs_close,
         .fstat_p = prov_vfs_fstat,
         .fcntl_p = prov_vfs_fcntl,
@@ -713,48 +349,37 @@ static esp_err_t prov_console_share_setup(struct provisioner* p)
         return err;
     }
     p->vfs_registered = true;
-    s_share_instance = p;
+    s_share_instance  = p;
 
     // Route stdout/stderr through the UART driver so that prints from the
     // application (and from this component) coexist with the driver TX
-    // path we now own.
+    // path we now own. Remember that we did this so teardown can revert
+    // it before the driver is uninstalled.
     uart_vfs_dev_use_driver((int)p->cfg.uart_num);
+    p->uart_vfs_redirected = true;
 
-    // Replace stdin with our filtered device. We dup() the existing fd 0
-    // first so we can restore it on stop.
-    int new_fd = open(PROV_VFS_BASE_PATH "/0", O_RDONLY);
-    if (new_fd < 0)
+    // Replace stdin with our filtered device. ESP-IDF's newlib does not
+    // expose dup()/dup2(), so we use freopen() instead -- it reuses the
+    // existing FILE* (so any stdio caller that captured `stdin` keeps the
+    // same handle) and atomically swaps the underlying fd.
+    if (freopen(PROV_VFS_BASE_PATH "/0", "r", stdin) == NULL)
     {
-        ESP_LOGE(TAG, "open %s: %d", PROV_VFS_BASE_PATH "/0", errno);
-        esp_vfs_unregister(PROV_VFS_BASE_PATH);
-        p->vfs_registered = false;
-        s_share_instance = NULL;
-        vStreamBufferDelete(p->stdin_stream);
-        p->stdin_stream = NULL;
-        vSemaphoreDelete(p->stdin_lock);
-        p->stdin_lock = NULL;
-        return ESP_FAIL;
-    }
-    p->saved_stdin_fd = dup(STDIN_FILENO); // may be -1 if no stdin yet
-    if (dup2(new_fd, STDIN_FILENO) < 0)
-    {
-        ESP_LOGE(TAG, "dup2 stdin: %d", errno);
-        close(new_fd);
-        if (p->saved_stdin_fd >= 0)
+        ESP_LOGE(TAG, "freopen stdin %s: %d", PROV_VFS_BASE_PATH "/0", errno);
+        if (p->uart_vfs_redirected)
         {
-            close(p->saved_stdin_fd);
+            uart_vfs_dev_use_nonblocking((int)p->cfg.uart_num);
+            p->uart_vfs_redirected = false;
         }
-        p->saved_stdin_fd = -1;
         esp_vfs_unregister(PROV_VFS_BASE_PATH);
         p->vfs_registered = false;
-        s_share_instance = NULL;
+        s_share_instance  = NULL;
         vStreamBufferDelete(p->stdin_stream);
         p->stdin_stream = NULL;
         vSemaphoreDelete(p->stdin_lock);
         p->stdin_lock = NULL;
         return ESP_FAIL;
     }
-    close(new_fd);
+    p->stdin_redirected = true;
 
     // Make sure stdio reads are unbuffered so a single-byte feed wakes the
     // console immediately. The IDF console normally does this itself but
@@ -769,9 +394,7 @@ static esp_err_t prov_console_share_teardown(struct provisioner* p)
 {
     if (p->stdin_lock)
     {
-        xSemaphoreTake(p->stdin_lock, portMAX_DELAY);
-        p->stdin_closing = true;
-        xSemaphoreGive(p->stdin_lock);
+        atomic_store(&p->stdin_closing, true);
 
         for (int i = 0; i < PROV_STOP_TIMEOUT_MS / PROV_STDIN_READ_POLL_MS; i++)
         {
@@ -795,11 +418,27 @@ static esp_err_t prov_console_share_teardown(struct provisioner* p)
         }
     }
 
-    if (p->saved_stdin_fd >= 0)
+    if (p->stdin_redirected)
     {
-        dup2(p->saved_stdin_fd, STDIN_FILENO);
-        close(p->saved_stdin_fd);
-        p->saved_stdin_fd = -1;
+        // Reattach stdin to the underlying UART VFS (the IDF default
+        // path). If this fails we leave stdin pointing at our (about-to-
+        // be-unregistered) VFS; subsequent reads will return EBADF, but
+        // that's strictly better than a dangling file* into freed memory.
+        char uart_path[24];
+        snprintf(uart_path, sizeof uart_path, "/dev/uart/%d", (int)p->cfg.uart_num);
+        if (freopen(uart_path, "r", stdin) == NULL)
+        {
+            ESP_LOGW(TAG, "freopen restore stdin %s: %d", uart_path, errno);
+        }
+        p->stdin_redirected = false;
+    }
+    // Revert stdout/stderr back to the non-blocking VFS path *before* the
+    // UART driver gets uninstalled by provisioner_stop, otherwise any
+    // subsequent printf/ESP_LOGx would route through a deleted driver.
+    if (p->uart_vfs_redirected)
+    {
+        uart_vfs_dev_use_nonblocking((int)p->cfg.uart_num);
+        p->uart_vfs_redirected = false;
     }
     if (p->vfs_registered)
     {
@@ -833,19 +472,16 @@ esp_err_t provisioner_start_uart(const provisioner_uart_config_t* cfg, provision
                         ESP_ERR_INVALID_ARG,
                         TAG,
                         "on_credentials required");
-    ESP_RETURN_ON_FALSE(!cfg->share_with_console || cfg->install_driver,
-                        ESP_ERR_INVALID_ARG,
-                        TAG,
-                        "share_with_console requires install_driver=true");
 
     struct provisioner* p = calloc(1, sizeof *p);
     if (!p)
     {
         return ESP_ERR_NO_MEM;
     }
-    p->cfg = *cfg;
-    p->saved_stdin_fd = -1;
-    p->share_state = PSS_LINE_START;
+    p->cfg              = *cfg;
+    p->stdin_redirected = false;
+    atomic_init(&p->stop, false);
+    atomic_init(&p->stdin_closing, false);
     p->task_done = xSemaphoreCreateBinary();
     if (p->task_done == NULL)
     {
@@ -864,6 +500,14 @@ esp_err_t provisioner_start_uart(const provisioner_uart_config_t* cfg, provision
     {
         p->cfg.rx_buffer_size = 1024;
     }
+    // share_with_console requires the component to install/manage the
+    // driver: any other code that re-installs UART0 would steal the byte
+    // stream. We auto-promote rather than fail to make the common case
+    // ergonomic.
+    if (p->cfg.share_with_console)
+    {
+        p->cfg.install_driver = true;
+    }
     // In shared mode prints have to flow through the driver, so we need a
     // TX buffer to avoid blocking the application on the UART FIFO.
     if (p->cfg.share_with_console && p->cfg.tx_buffer_size == 0)
@@ -871,16 +515,29 @@ esp_err_t provisioner_start_uart(const provisioner_uart_config_t* cfg, provision
         p->cfg.tx_buffer_size = 256;
     }
 
+    // Wire up the protocol parser.
+    prov_proto_config_t pcfg     = {0};
+    pcfg.write                   = prov_uart_write_cb;
+    pcfg.forward                 = prov_uart_forward_cb;
+    pcfg.io_ctx                  = p;
+    pcfg.on_credentials          = prov_credentials_trampoline;
+    pcfg.user_ctx                = p;
+    pcfg.device_name             = p->cfg.device_name;
+    pcfg.share_with_console      = p->cfg.share_with_console;
+    pcfg.min_probe_interval_ms   = PROV_PROBE_MIN_INTERVAL_MS;
+    pcfg.now_ms                  = prov_now_ms_cb;
+    prov_proto_init(&p->proto, &pcfg);
+
     esp_err_t err = ESP_OK;
 
     if (p->cfg.install_driver)
     {
         const uart_config_t uart_cfg = {
-            .baud_rate = p->cfg.baud_rate,
-            .data_bits = UART_DATA_8_BITS,
-            .parity = UART_PARITY_DISABLE,
-            .stop_bits = UART_STOP_BITS_1,
-            .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+            .baud_rate  = p->cfg.baud_rate,
+            .data_bits  = UART_DATA_8_BITS,
+            .parity     = UART_PARITY_DISABLE,
+            .stop_bits  = UART_STOP_BITS_1,
+            .flow_ctrl  = UART_HW_FLOWCTRL_DISABLE,
             .source_clk = UART_SCLK_DEFAULT,
         };
         err = uart_driver_install(p->cfg.uart_num,
@@ -932,13 +589,14 @@ esp_err_t provisioner_start_uart(const provisioner_uart_config_t* cfg, provision
     }
 
     BaseType_t ok;
+    int        prio = p->cfg.task_priority > 0 ? p->cfg.task_priority : 5;
     if (p->cfg.task_core_id < 0)
     {
         ok = xTaskCreate(prov_task,
                          "provisioner",
                          p->cfg.task_stack_size,
                          p,
-                         p->cfg.task_priority ? p->cfg.task_priority : 5,
+                         prio,
                          &p->task);
     }
     else
@@ -947,7 +605,7 @@ esp_err_t provisioner_start_uart(const provisioner_uart_config_t* cfg, provision
                                      "provisioner",
                                      p->cfg.task_stack_size,
                                      p,
-                                     p->cfg.task_priority ? p->cfg.task_priority : 5,
+                                     prio,
                                      &p->task,
                                      p->cfg.task_core_id);
     }
@@ -983,7 +641,7 @@ esp_err_t provisioner_stop(provisioner_handle_t h)
     {
         return ESP_ERR_INVALID_STATE;
     }
-    h->stop = true;
+    atomic_store(&h->stop, true);
     if (!h->task_stopped)
     {
         if (xSemaphoreTake(h->task_done, pdMS_TO_TICKS(PROV_STOP_TIMEOUT_MS)) != pdTRUE)

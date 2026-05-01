@@ -61,12 +61,20 @@ static bool on_creds(const char *ssid, const char *password,
 void app_main(void) {
     provisioner_uart_config_t cfg = PROVISIONER_UART_CONFIG_DEFAULT();
     cfg.on_credentials = on_creds;
+    cfg.device_name    = "Kitchen Caller ID";  // shown in the web page
     ESP_ERROR_CHECK(provisioner_start_uart(&cfg, NULL));
 }
 ```
 
+When `device_name` is set, the web page displays
+"Connected to *Kitchen Caller ID*." right under the status line so the
+user can confirm which board they are talking to.
+
 A complete project is in
-[`esp32/provisioner/examples/basic/`](esp32/provisioner/examples/basic/):
+[`esp32/provisioner/examples/basic/`](esp32/provisioner/examples/basic/),
+and a second one demonstrating
+[`share_with_console`](esp32/provisioner/examples/shared_console/) on the
+same UART as the IDF console:
 
 ```sh
 cd esp32/provisioner/examples/basic
@@ -111,6 +119,7 @@ stream.
 |--------------|----------------------------------------------------------|------------------------------------|
 | Web → ESP32  | `<<PROV?>>`                                              | Attention probe                    |
 | ESP32 → Web  | `<<PROV!>>`                                              | Ready to receive credentials       |
+| ESP32 → Web  | `<<PROV:ID <name_b64>>>`                                 | Optional human-readable device name|
 | Web → ESP32  | `<<PROV:SET <ssid_b64> <pass_b64> <crc16_hex>>>`         | Set credentials                    |
 | ESP32 → Web  | `<<PROV:OK>>`                                            | Credentials accepted               |
 | ESP32 → Web  | `<<PROV:ERR <reason>>>`                                  | Failure (`reason` is a short token)|
@@ -124,6 +133,12 @@ stream.
   xorout) computed over the literal ASCII string
   `"<ssid_b64> <pass_b64>"` (the two Base64 strings joined by exactly
   one space).
+- After `<<PROV!>>` the ESP32 may emit a single
+  `<<PROV:ID <name_b64>>>` line whose payload is the Base64-encoded
+  human-readable device name set by the firmware (`cfg.device_name`).
+  The web page decodes it and shows "Connected to *name*." so the user
+  can confirm which device they are provisioning. Older firmware that
+  doesn't emit this line still works.
 - Base64 and CRC framing are for transport robustness, not secrecy or
   authentication. Treat provisioning as a local serial-access operation.
 
@@ -155,9 +170,15 @@ esp32/provisioner/                         ESP-IDF v6 component
   Kconfig                                  menuconfig defaults
   idf_component.yml                        Component manifest
   include/provisioner.h                    Public C API
-  src/provisioner.c                        Implementation
+  src/provisioner.c                        ESP-IDF / UART glue
+  src/provisioner_proto.[ch]               Transport-agnostic protocol parser
   examples/basic/                          Standalone example project
-    CMakeLists.txt
-    main/CMakeLists.txt
-    main/main.c
+  examples/shared_console/                 Provisioner sharing UART0 with
+                                           the IDF console
+  test/host/                               Host-side unit tests for the
+                                           protocol parser (no IDF
+                                           required; run with `cmake -S
+                                           esp32/provisioner/test/host -B
+                                           build && cmake --build build &&
+                                           ctest --test-dir build`)
 ```
