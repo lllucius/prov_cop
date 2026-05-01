@@ -413,8 +413,7 @@
       sessionStorage.removeItem(RELOAD_PASS_KEY);
       if (savedSsid) ssidEl.value = savedSsid;
       if (savedPass) passEl.value = savedPass;
-      setStatus("Browser refreshed. Continuing provisioning...");
-      setTimeout(() => { form.requestSubmit(); }, 0);
+      setStatus("Browser refreshed. Click 'Send to ESP32' to continue.");
     } catch (_) {}
   }
 
