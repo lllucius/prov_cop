@@ -543,15 +543,18 @@
         try { s.writer.releaseLock(); } catch (_) {}
       }
     } catch (_) {}
-    try { if (s.port.writable) await s.port.writable.abort(); } catch (_) {}
+    try { if (s.port.writable) await s.port.writable.abort(); }
+    catch (e) { console.log("[close] writable.abort error:", e && e.message || e); }
     t = step("writable.abort", t);
-    try { if (s.reader) await s.reader.cancel(); } catch (_) {}
+    try { if (s.reader) await s.reader.cancel(); }
+    catch (e) { console.log("[close] reader.cancel error:", e && e.message || e); }
     t = step("reader.cancel", t);
     // Wait for the pump to fully unwind before releasing the lock.
     try { if (s.pumpDone) await s.pumpDone; } catch (_) {}
     t = step("pumpDone", t);
     try { if (s.reader) s.reader.releaseLock(); } catch (_) {}
-    try { await s.port.close(); } catch (_) {}
+    try { await s.port.close(); }
+    catch (e) { console.log("[close] port.close error:", e && e.message || e); }
     step("port.close", t);
     // eslint-disable-next-line no-console
     console.log("[close] total " + ((typeof performance !== "undefined" ? performance.now() : Date.now()) - t0).toFixed(0) + "ms");
