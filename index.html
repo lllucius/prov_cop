@@ -336,6 +336,9 @@
   const alertEl   = $("alert");
   const logEl     = $("log");
   const clearLogBtn = $("clear-log-btn");
+  const RELOAD_NOTICE_KEY = "prov_reload_notice";
+  const RELOAD_SSID_KEY   = "prov_reload_ssid";
+  const RELOAD_PASS_KEY   = "prov_reload_pass";
 
   // Log buffer cap: trim from the front when the on-page log grows past this
   // many characters, to avoid unbounded memory / DOM growth on long sessions.
@@ -345,6 +348,7 @@
     supportEl.hidden = false;
     sendBtn.disabled = true;
   }
+  restorePostReloadNotice();
 
   showPass.addEventListener("change", () => {
     passEl.type = showPass.checked ? "text" : "password";
@@ -372,6 +376,26 @@
   function setAlert(text) {
     alertEl.textContent = text;
     alertEl.hidden = false;
+  }
+
+  function restorePostReloadNotice() {
+    try {
+      const notice = sessionStorage.getItem(RELOAD_NOTICE_KEY);
+      if (!notice) return;
+      sessionStorage.removeItem(RELOAD_NOTICE_KEY);
+      const savedSsid = sessionStorage.getItem(RELOAD_SSID_KEY) || "";
+      const savedPass = sessionStorage.getItem(RELOAD_PASS_KEY) || "";
+      sessionStorage.removeItem(RELOAD_SSID_KEY);
+      sessionStorage.removeItem(RELOAD_PASS_KEY);
+      if (savedSsid) ssidEl.value = savedSsid;
+      if (savedPass) passEl.value = savedPass;
+      setStatus("Browser reset complete. Please click 'Send to ESP32' again.");
+      setAlert(notice);
+      alertEl.tabIndex = -1;
+      alertEl.focus();
+    } catch (_) {
+      // Ignore storage failures (private mode/policy); UX still works.
+    }
   }
 
   // ---- Encoding helpers ------------------------------------------------------
@@ -896,6 +920,12 @@
 
   function reloadPageSoon(reason) {
     setStatus(reason + " Refreshing the page to reset Web Serial state...");
+    try {
+      sessionStorage.setItem(RELOAD_NOTICE_KEY,
+        reason + " The page was refreshed to clear a stuck serial handle.");
+      sessionStorage.setItem(RELOAD_SSID_KEY, ssidEl.value || "");
+      sessionStorage.setItem(RELOAD_PASS_KEY, passEl.value || "");
+    } catch (_) {}
     setTimeout(() => {
       try {
         window.location.reload();
