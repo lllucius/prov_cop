@@ -572,8 +572,11 @@
     } catch (e) { console.log("[close] pumpDone error:", e && e.message || e); }
     t = step("pumpDone", t);
     try { if (s.reader) s.reader.releaseLock(); } catch (_) {}
-    try { await s.port.close(); }
-    catch (e) { console.log("[close] port.close error:", e && e.message || e); }
+    try {
+      // port.close() can also block waiting for stream shutdown on some
+      // browser/device combinations; bound it so UI can recover promptly.
+      await withTimeout(s.port.close(), 1000, "port.close");
+    } catch (e) { console.log("[close] port.close error:", e && e.message || e); }
     step("port.close", t);
     // eslint-disable-next-line no-console
     console.log("[close] total " + ((typeof performance !== "undefined" ? performance.now() : Date.now()) - t0).toFixed(0) + "ms");
