@@ -510,7 +510,16 @@
     const s = session;
     session = null;
     try { s.abort.abort(); } catch (_) {}
+    // Reject any in-flight waiter so the persistent pump's pending
+    // .read() resolves cleanly when we cancel below.
+    if (s.waiter) {
+      const w = s.waiter;
+      s.waiter = null;
+      try { w.reject(new Error("cancelled")); } catch (_) {}
+    }
     try { if (s.reader) await s.reader.cancel(); } catch (_) {}
+    // Wait for the pump to fully unwind before releasing the lock.
+    try { if (s.pumpDone) await s.pumpDone; } catch (_) {}
     try { if (s.reader) s.reader.releaseLock(); } catch (_) {}
     try { if (s.writer) s.writer.releaseLock(); } catch (_) {}
     try { await s.port.close(); } catch (_) {}
@@ -519,10 +528,56 @@
   function makeSession(port) {
     const writer = port.writable.getWriter();
     const reader = port.readable.getReader();
-    const decoder = new TextDecoder();
     const abort = new AbortController();
-    const s = { port, reader, writer, abort, buffer: "" };
+    const s = {
+      port, reader, writer, abort,
+      buffer: "",
+      // At most one waiter is registered at a time (the protocol flow is
+      // strictly sequential). Stored as { re, resolve, reject, timer }.
+      waiter: null,
+      decoder: new TextDecoder(),
+      pumpDone: null,
+    };
+
+    // Single persistent reader pump: drains reader.read() into s.buffer
+    // and notifies the active waiter (if any) when its regex matches.
+    // Using one pump (instead of one per waitForMatch call) avoids the
+    // class of bug where a timed-out waiter leaves an orphaned read()
+    // that swallows the next chunk into the wrong consumer.
+    s.pumpDone = (async function pump() {
+      try {
+        while (true) {
+          const { value, done } = await s.reader.read();
+          if (done) break;
+          if (!value || !value.byteLength) continue;
+          const chunk = s.decoder.decode(value, { stream: true });
+          logSerial("RX", chunk);
+          s.buffer += chunk;
+          // Cap buffer size to protect against runaway input.
+          if (s.buffer.length > 8192) {
+            s.buffer = s.buffer.slice(-4096);
+          }
+          tryDeliver(s);
+        }
+      } catch (_) {
+        // Pump exits on reader.cancel() or stream error; waiter cleanup
+        // is handled by closeSession / abort handlers.
+      }
+    })();
+
     return s;
+  }
+
+  // If a waiter is registered and its regex now matches the buffer,
+  // consume the matched bytes and resolve it.
+  function tryDeliver(s) {
+    if (!s.waiter) return;
+    const m = s.waiter.re.exec(s.buffer);
+    if (!m) return;
+    s.buffer = s.buffer.slice(m.index + m[0].length);
+    const w = s.waiter;
+    s.waiter = null;
+    w.resolve(m);
   }
 
   async function sendLine(s, line) {
@@ -531,69 +586,44 @@
     await s.writer.write(data);
   }
 
-  // Reads from the port and resolves when matchRe matches the accumulated
-  // buffer. Rejects on timeout or abort. Returns the regex match.
+  // Resolves when matchRe matches the accumulated session buffer.
+  // Rejects on timeout or abort. Returns the regex match.
+  // Relies on the session's persistent pump to fill the buffer; only one
+  // waiter may be registered at a time (the provisioning flow is
+  // strictly sequential), which matches our usage.
   function waitForMatch(s, matchRe, timeoutMs) {
     return new Promise((resolve, reject) => {
-      let timer = setTimeout(() => {
+      // Fast path: buffer already contains a match.
+      const existing = matchRe.exec(s.buffer);
+      if (existing) {
+        s.buffer = s.buffer.slice(existing.index + existing[0].length);
+        resolve(existing);
+        return;
+      }
+      if (s.waiter) {
+        // Should not happen given the sequential flow, but fail loudly
+        // rather than silently dropping the previous waiter.
+        reject(new Error("internal: waiter already registered"));
+        return;
+      }
+
+      const w = { re: matchRe, resolve: null, reject: null, timer: null };
+      const cleanup = () => {
+        if (w.timer) { clearTimeout(w.timer); w.timer = null; }
+        s.abort.signal.removeEventListener("abort", onAbort);
+        if (s.waiter === w) s.waiter = null;
+      };
+      const onAbort = () => { cleanup(); reject(new Error("cancelled")); };
+
+      w.resolve = (m) => { cleanup(); resolve(m); };
+      w.reject  = (e) => { cleanup(); reject(e); };
+      w.timer   = setTimeout(() => {
         cleanup();
         reject(new Error("timeout"));
       }, timeoutMs);
 
-      const onAbort = () => {
-        cleanup();
-        reject(new Error("cancelled"));
-      };
       s.abort.signal.addEventListener("abort", onAbort, { once: true });
-
-      function cleanup() {
-        clearTimeout(timer);
-        s.abort.signal.removeEventListener("abort", onAbort);
-      }
-
-      // First, see if the existing buffer already contains a match.
-      const existing = matchRe.exec(s.buffer);
-      if (existing) {
-        // Trim consumed portion so further calls don't re-match.
-        s.buffer = s.buffer.slice(existing.index + existing[0].length);
-        cleanup();
-        resolve(existing);
-        return;
-      }
-
-      const decoder = new TextDecoder();
-
-      (async function pump() {
-        try {
-          while (true) {
-            const { value, done } = await s.reader.read();
-            if (done) {
-              cleanup();
-              reject(new Error("serial port closed"));
-              return;
-            }
-            if (value && value.byteLength) {
-              const chunk = decoder.decode(value, { stream: true });
-              logSerial("RX", chunk);
-              s.buffer += chunk;
-              // Cap buffer size to protect against runaway input.
-              if (s.buffer.length > 8192) {
-                s.buffer = s.buffer.slice(-4096);
-              }
-              const m = matchRe.exec(s.buffer);
-              if (m) {
-                s.buffer = s.buffer.slice(m.index + m[0].length);
-                cleanup();
-                resolve(m);
-                return;
-              }
-            }
-          }
-        } catch (e) {
-          cleanup();
-          reject(e);
-        }
-      })();
+      s.waiter = w;
     });
   }
 
