@@ -129,9 +129,11 @@ static bool prov_credentials_trampoline(const char* ssid,
     }
     bool ok =
         p->cfg.on_credentials(ssid, password, err_out, err_out_len, p->cfg.user_ctx);
-    // Avoid logging the SSID verbatim: it is user-controlled and may
-    // contain terminal escape sequences or other content unsuitable for
-    // the same UART that just delivered it. Log only its length.
+    // Avoid logging the SSID verbatim: it is attacker-controllable input
+    // arriving on the same UART as the log sink, so a hostile peer could
+    // otherwise inject terminal escape sequences (or crafted bytes) into
+    // a serial monitor or log aggregator. Log only the length, which is
+    // useful for diagnostics but not exploitable.
     if (ok)
     {
         ESP_LOGI(TAG, "credentials accepted (ssid_len=%u)", (unsigned)strlen(ssid));

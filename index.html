@@ -271,7 +271,9 @@
   const ATTENTION_TIMEO = 8000; // ms total to get a READY
   const ID_GRACE_MS     = 200;  // additional time to wait for a follow-up ID frame
   const RESULT_TIMEO    = 30000; // ms to wait for OK/ERR after SET
-  const DEVICE_NAME_MAX = 64;   // mirror PROV_PROTO_MAX_NAME_LEN on the firmware
+  const DEVICE_NAME_MAX = 64;   // matches PROV_PROTO_MAX_NAME_LEN in the
+                                // firmware (esp32/provisioner/src/provisioner_proto.h).
+                                // Keep these in sync if the firmware constant changes.
 
   // ---- DOM -------------------------------------------------------------------
   const $ = (id) => document.getElementById(id);
