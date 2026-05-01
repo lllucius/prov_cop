@@ -64,16 +64,7 @@ int mbedtls_base64_decode(unsigned char* dst,
     {
         unsigned char c = src[i];
         signed char   v = b64_decode_tab[c];
-        if (v < 0 && !(c == 'A' && v == 0))
-        {
-            // table lookup returns 0 for 'A' which is valid; only treat
-            // as error for non-alphabet bytes.
-            if (b64_decode_tab[c] == 0 && c != 'A')
-            {
-                return MBEDTLS_ERR_BASE64_INVALID_CHARACTER;
-            }
-        }
-        if (b64_decode_tab[c] == 0 && c != 'A')
+        if (v == 0 && c != 'A')
         {
             return MBEDTLS_ERR_BASE64_INVALID_CHARACTER;
         }

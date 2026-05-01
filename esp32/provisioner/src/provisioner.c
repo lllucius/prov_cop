@@ -224,25 +224,35 @@ static ssize_t prov_vfs_read(void* ctx, int fd, void* dst, size_t size)
     {
         return 0;
     }
-    // FreeRTOS stream buffers are SPSC: serialize concurrent readers under
-    // stdin_lock so two callers don't corrupt the receive state, and so
-    // teardown can wait for active reads to finish.
-    xSemaphoreTake(p->stdin_lock, portMAX_DELAY);
     if (atomic_load(&p->stdin_closing))
     {
-        xSemaphoreGive(p->stdin_lock);
         return 0;
     }
+
+    // Track that a reader is in-flight so teardown can wait for us to
+    // finish before deleting the underlying stream buffer / mutex.
+    xSemaphoreTake(p->stdin_lock, portMAX_DELAY);
     p->stdin_readers++;
+    xSemaphoreGive(p->stdin_lock);
 
     size_t got = 0;
     while (got == 0)
     {
-        got = xStreamBufferReceive(p->stdin_stream,
-                                   dst,
-                                   size,
-                                   pdMS_TO_TICKS(PROV_STDIN_READ_POLL_MS));
-        if (got > 0)
+        // FreeRTOS stream buffers are SPSC: serialize the actual receive
+        // call across (rare) concurrent readers, but release the lock
+        // between iterations so teardown can observe counter changes
+        // promptly.
+        xSemaphoreTake(p->stdin_lock, portMAX_DELAY);
+        bool closing = atomic_load(&p->stdin_closing);
+        if (!closing)
+        {
+            got = xStreamBufferReceive(p->stdin_stream,
+                                       dst,
+                                       size,
+                                       pdMS_TO_TICKS(PROV_STDIN_READ_POLL_MS));
+        }
+        xSemaphoreGive(p->stdin_lock);
+        if (got > 0 || closing)
         {
             break;
         }
@@ -252,6 +262,7 @@ static ssize_t prov_vfs_read(void* ctx, int fd, void* dst, size_t size)
         }
     }
 
+    xSemaphoreTake(p->stdin_lock, portMAX_DELAY);
     p->stdin_readers--;
     xSemaphoreGive(p->stdin_lock);
     return (ssize_t)got;
