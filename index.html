@@ -337,6 +337,9 @@
   const RELOAD_NOTICE_KEY = "prov_reload_notice";
   const RELOAD_SSID_KEY   = "prov_reload_ssid";
   const RELOAD_PASS_KEY   = "prov_reload_pass";
+  // Sentinel thrown by openPort() after triggering reloadPageSoon(), so the
+  // submit handler's catch block can suppress the alert (the page is reloading).
+  const RELOAD_SENTINEL   = "Reloading page to reset serial state.";
 
   // Log buffer cap: trim from the front when the on-page log grows past this
   // many characters, to avoid unbounded memory / DOM growth on long sessions.
@@ -570,9 +573,11 @@
           if (/already open/i.test(msg2)) {
             // Both close attempts failed. The browser's internal Web Serial
             // state is stuck. A page reload is the only known recovery.
+            // reloadPageSoon() sets a user-visible status; RELOAD_SENTINEL is
+            // the internal signal to the submit handler's catch block.
             reloadPageSoon("The serial port could not be closed.");
             // Throw so the caller's finally block runs (re-enables button etc.)
-            throw new Error("Reloading page to reset serial state.");
+            throw new Error(RELOAD_SENTINEL);
           }
           throw e2;
         }
@@ -985,7 +990,7 @@
     try {
       await provision(ssid, pass);
     } catch (e) {
-      if (e.message !== "Reloading page to reset serial state.") {
+      if (e.message !== RELOAD_SENTINEL) {
         setAlert(e.message || String(e));
       }
     } finally {
