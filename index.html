@@ -153,7 +153,15 @@
   </p>
 
   <h2>Step 2 of 3: Enter Wi-Fi details</h2>
-  <form id="prov-form" novalidate>
+  <!--
+    action="javascript:void(0)" stops the browser from attempting a
+    same-document navigation on submit. With a missing/empty action the form
+    defaults to the current URL; under file:// origins (which are unique
+    opaque origins) Chrome logs an "Unsafe attempt to load URL ... from
+    frame with URL ..." warning even though our submit handler calls
+    preventDefault().
+  -->
+  <form id="prov-form" novalidate action="javascript:void(0)">
     <fieldset>
       <legend>Wi-Fi network</legend>
 
@@ -367,6 +375,35 @@
 
   // ---- Serial session --------------------------------------------------------
   let session = null;  // { port, reader, writer, abort, buffer }
+  let busy    = false; // guards against re-entrant submits while a session
+                       // is winding down (port.close() is async).
+
+  // Format a chunk of serial data for the devtools console: render printable
+  // characters as-is and escape control / non-printable bytes as \xNN so
+  // line noise is visible without breaking the console line.
+  function formatSerialChunk(text) {
+    let printable = "";
+    for (let i = 0; i < text.length; i++) {
+      const c = text.charCodeAt(i);
+      if (c === 0x0A) printable += "\\n";
+      else if (c === 0x0D) printable += "\\r";
+      else if (c === 0x09) printable += "\\t";
+      else if (c < 0x20 || c === 0x7F) {
+        printable += "\\x" + c.toString(16).padStart(2, "0");
+      } else {
+        printable += text[i];
+      }
+    }
+    return printable;
+  }
+  function logSerial(direction, text) {
+    if (!text) return;
+    // %c lets us colour-code TX vs RX in the devtools console.
+    const colour = direction === "TX" ? "color:#0b5fff" : "color:#0a7a2f";
+    // eslint-disable-next-line no-console
+    console.log("%c[serial %s]%c %s", colour, direction, "color:inherit",
+                formatSerialChunk(text));
+  }
 
   async function openPort() {
     let port;
@@ -407,6 +444,7 @@
   }
 
   async function sendLine(s, line) {
+    logSerial("TX", line);
     const data = new TextEncoder().encode(line);
     await s.writer.write(data);
   }
@@ -453,7 +491,9 @@
               return;
             }
             if (value && value.byteLength) {
-              s.buffer += decoder.decode(value, { stream: true });
+              const chunk = decoder.decode(value, { stream: true });
+              logSerial("RX", chunk);
+              s.buffer += chunk;
               // Cap buffer size to protect against runaway input.
               if (s.buffer.length > 8192) {
                 s.buffer = s.buffer.slice(-4096);
@@ -541,6 +581,9 @@
         throw new Error("The ESP32 reported a failure: " + reason);
       }
     } finally {
+      // Fully close the port (including awaiting port.close()) BEFORE
+      // re-enabling the Send button, otherwise a quick re-submit hits
+      // "The port is already open." on the next port.open().
       await closeSession();
       sendBtn.disabled   = false;
       cancelBtn.disabled = true;
@@ -551,6 +594,12 @@
   form.addEventListener("submit", async (ev) => {
     ev.preventDefault();
     clearAlert();
+
+    if (busy) {
+      // A previous attempt is still tearing down (port.close() is async);
+      // ignore this submit so we don't race into "port is already open".
+      return;
+    }
 
     if (!("serial" in navigator)) {
       setAlert("Web Serial is not available in this browser.");
@@ -576,23 +625,35 @@
       return;
     }
 
+    busy = true;
     try {
       await provision(ssid, pass);
     } catch (err) {
-      setStatus("Stopped.");
-      setAlert(err && err.message ? err.message : String(err));
-      // Move focus to the alert so JAWS users land on the failure message.
-      alertEl.tabIndex = -1;
-      alertEl.focus();
+      const msg = err && err.message ? err.message : String(err);
+      if (msg === "cancelled") {
+        setStatus("Cancelled. You can try again.");
+      } else {
+        setStatus("Stopped.");
+        setAlert(msg);
+        // Move focus to the alert so JAWS users land on the failure message.
+        alertEl.tabIndex = -1;
+        alertEl.focus();
+      }
+    } finally {
+      busy = false;
     }
   });
 
-  cancelBtn.addEventListener("click", async () => {
-    setStatus("Cancelling...");
-    await closeSession();
-    sendBtn.disabled   = false;
+  cancelBtn.addEventListener("click", () => {
+    // Only signal the in-flight provision() to abort; the finally block in
+    // provision() will close the port, await port.close(), and re-enable
+    // the Send button. Doing the close here too would race with that
+    // cleanup and could leave the port half-open ("already open" on the
+    // next attempt).
+    if (!session) return;
     cancelBtn.disabled = true;
-    setStatus("Cancelled. You can try again.");
+    setStatus("Cancelling...");
+    try { session.abort.abort(); } catch (_) {}
   });
 
   // Best-effort cleanup if the user closes the tab mid-session.
