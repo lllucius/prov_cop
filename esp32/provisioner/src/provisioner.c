@@ -7,15 +7,12 @@
 
 #include "provisioner.h"
 
-#include <ctype.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <unistd.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -75,7 +72,7 @@ struct provisioner
     int                  stdin_readers;
     atomic_bool          stdin_closing;
     bool                 vfs_registered;
-    int                  saved_stdin_fd; // -1 if no redirection
+    bool                 stdin_redirected;
 };
 
 // Single shared instance pointer used by the VFS callbacks.
@@ -317,8 +314,8 @@ static esp_err_t prov_console_share_setup(struct provisioner* p)
         return ESP_ERR_INVALID_STATE;
     }
 
-    p->saved_stdin_fd = -1;
-    p->stdin_lock     = xSemaphoreCreateMutex();
+    p->stdin_redirected = false;
+    p->stdin_lock       = xSemaphoreCreateMutex();
     if (p->stdin_lock == NULL)
     {
         return ESP_ERR_NO_MEM;
@@ -359,12 +356,13 @@ static esp_err_t prov_console_share_setup(struct provisioner* p)
     uart_vfs_dev_use_driver((int)p->cfg.uart_num);
     p->uart_vfs_redirected = true;
 
-    // Replace stdin with our filtered device. We dup() the existing fd 0
-    // first so we can restore it on stop.
-    int new_fd = open(PROV_VFS_BASE_PATH "/0", O_RDONLY);
-    if (new_fd < 0)
+    // Replace stdin with our filtered device. ESP-IDF's newlib does not
+    // expose dup()/dup2(), so we use freopen() instead -- it reuses the
+    // existing FILE* (so any stdio caller that captured `stdin` keeps the
+    // same handle) and atomically swaps the underlying fd.
+    if (freopen(PROV_VFS_BASE_PATH "/0", "r", stdin) == NULL)
     {
-        ESP_LOGE(TAG, "open %s: %d", PROV_VFS_BASE_PATH "/0", errno);
+        ESP_LOGE(TAG, "freopen stdin %s: %d", PROV_VFS_BASE_PATH "/0", errno);
         if (p->uart_vfs_redirected)
         {
             uart_vfs_dev_use_nonblocking((int)p->cfg.uart_num);
@@ -379,31 +377,7 @@ static esp_err_t prov_console_share_setup(struct provisioner* p)
         p->stdin_lock = NULL;
         return ESP_FAIL;
     }
-    p->saved_stdin_fd = dup(STDIN_FILENO); // may be -1 if no stdin yet
-    if (dup2(new_fd, STDIN_FILENO) < 0)
-    {
-        ESP_LOGE(TAG, "dup2 stdin: %d", errno);
-        close(new_fd);
-        if (p->saved_stdin_fd >= 0)
-        {
-            close(p->saved_stdin_fd);
-        }
-        p->saved_stdin_fd = -1;
-        if (p->uart_vfs_redirected)
-        {
-            uart_vfs_dev_use_nonblocking((int)p->cfg.uart_num);
-            p->uart_vfs_redirected = false;
-        }
-        esp_vfs_unregister(PROV_VFS_BASE_PATH);
-        p->vfs_registered = false;
-        s_share_instance  = NULL;
-        vStreamBufferDelete(p->stdin_stream);
-        p->stdin_stream = NULL;
-        vSemaphoreDelete(p->stdin_lock);
-        p->stdin_lock = NULL;
-        return ESP_FAIL;
-    }
-    close(new_fd);
+    p->stdin_redirected = true;
 
     // Make sure stdio reads are unbuffered so a single-byte feed wakes the
     // console immediately. The IDF console normally does this itself but
@@ -442,11 +416,19 @@ static esp_err_t prov_console_share_teardown(struct provisioner* p)
         }
     }
 
-    if (p->saved_stdin_fd >= 0)
+    if (p->stdin_redirected)
     {
-        dup2(p->saved_stdin_fd, STDIN_FILENO);
-        close(p->saved_stdin_fd);
-        p->saved_stdin_fd = -1;
+        // Reattach stdin to the underlying UART VFS (the IDF default
+        // path). If this fails we leave stdin pointing at our (about-to-
+        // be-unregistered) VFS; subsequent reads will return EBADF, but
+        // that's strictly better than a dangling file* into freed memory.
+        char uart_path[24];
+        snprintf(uart_path, sizeof uart_path, "/dev/uart/%d", (int)p->cfg.uart_num);
+        if (freopen(uart_path, "r", stdin) == NULL)
+        {
+            ESP_LOGW(TAG, "freopen restore stdin %s: %d", uart_path, errno);
+        }
+        p->stdin_redirected = false;
     }
     // Revert stdout/stderr back to the non-blocking VFS path *before* the
     // UART driver gets uninstalled by provisioner_stop, otherwise any
@@ -494,8 +476,8 @@ esp_err_t provisioner_start_uart(const provisioner_uart_config_t* cfg, provision
     {
         return ESP_ERR_NO_MEM;
     }
-    p->cfg            = *cfg;
-    p->saved_stdin_fd = -1;
+    p->cfg              = *cfg;
+    p->stdin_redirected = false;
     atomic_init(&p->stop, false);
     atomic_init(&p->stdin_closing, false);
     p->task_done = xSemaphoreCreateBinary();
