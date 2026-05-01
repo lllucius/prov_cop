@@ -311,7 +311,10 @@
   const PROBE_INTERVAL  = 500;  // ms
   const ATTENTION_TIMEO = 8000; // ms total to get a READY
   const ID_GRACE_MS     = 200;  // additional time to wait for a follow-up ID frame
-  const RESULT_TIMEO    = 30000; // ms to wait for OK/ERR after SET
+  const RESULT_TIMEO    = 90000; // ms to wait for OK/ERR after SET. The ESP32
+                                 // example retries Wi-Fi up to 5 times before
+                                 // reporting auth_or_unreachable, which can
+                                 // legitimately take 30s+; give it headroom.
   // Diagnostic logging in the devtools console. Cheap and non-intrusive;
   // leave on so users can attach the console output to bug reports.
   const DEBUG           = true;
@@ -752,8 +755,19 @@
       const setLine = "<<PROV:SET " + ssidB64 + " " + passB64 + " " + crc + ">>\n";
       await sendLine(session, setLine);
 
-      // Wait for result.
-      setStatus("Waiting for the ESP32 to confirm...");
+      // Wait for result. The ESP32 may legitimately take many seconds to
+      // respond — it has to (re)connect to Wi-Fi, possibly retry, and only
+      // then emits <<PROV:OK>> / <<PROV:ERR ...>>. Show a live elapsed-time
+      // counter so the user can see we're still waiting, not hung.
+      const waitStart = Date.now();
+      const tickStatus = () => {
+        const sec = Math.floor((Date.now() - waitStart) / 1000);
+        setStatus("Waiting for the ESP32 to confirm... (" + sec +
+                  "s; this can take up to " + (RESULT_TIMEO / 1000) +
+                  "s while the ESP32 tries to join the Wi-Fi network)");
+      };
+      tickStatus();
+      const tickTimer = setInterval(tickStatus, 1000);
       let result;
       try {
         result = await waitForMatch(session, RESULT_RE, RESULT_TIMEO);
@@ -766,6 +780,8 @@
           );
         }
         throw e;
+      } finally {
+        clearInterval(tickTimer);
       }
       const kind   = result[1];   // "OK" or "ERR ..."
       if (kind === "OK") {
