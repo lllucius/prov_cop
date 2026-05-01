@@ -493,7 +493,28 @@
   }
   clearLogBtn.addEventListener("click", clearLog);
 
+  async function closePortBestEffort(port, timeoutMs) {
+    if (!port) return;
+    try {
+      await Promise.race([
+        port.close(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("close timeout")), timeoutMs)),
+      ]);
+    } catch (_) {
+      // Ignore: this is best-effort cleanup before opening/reopening.
+    }
+  }
+
   async function openPort() {
+    // If a previous close timed out, the browser can still consider a granted
+    // port open. Best-effort close all granted ports before prompting again.
+    try {
+      const granted = await navigator.serial.getPorts();
+      for (const p of granted) {
+        await closePortBestEffort(p, 250);
+      }
+    } catch (_) {}
+
     let port;
     try {
       port = await navigator.serial.requestPort();
@@ -501,14 +522,43 @@
       // User cancelled the chooser, or no device.
       throw new Error("No serial device was selected.");
     }
-    await port.open({
-      baudRate: BAUD,
-      dataBits: 8,
-      stopBits: 1,
-      parity:   "none",
-      flowControl: "none",
-    });
+    try {
+      await port.open({
+        baudRate: BAUD,
+        dataBits: 8,
+        stopBits: 1,
+        parity:   "none",
+        flowControl: "none",
+      });
+    } catch (e) {
+      const msg = e && e.message ? String(e.message) : String(e);
+      if (/already open/i.test(msg)) {
+        // One more targeted close/retry for the selected handle.
+        await closePortBestEffort(port, 1000);
+        await port.open({
+          baudRate: BAUD,
+          dataBits: 8,
+          stopBits: 1,
+          parity:   "none",
+          flowControl: "none",
+        });
+      } else {
+        throw e;
+      }
+    }
     return port;
+  }
+
+  async function withTimeout(promise, timeoutMs, label) {
+    let timer;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(label + " timeout")), timeoutMs);
+    });
+    try {
+      return await Promise.race([promise, timeout]);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   async function closeSession() {
@@ -546,15 +596,25 @@
     try { if (s.port.writable) await s.port.writable.abort(); }
     catch (e) { console.log("[close] writable.abort error:", e && e.message || e); }
     t = step("writable.abort", t);
-    try { if (s.reader) await s.reader.cancel(); }
-    catch (e) { console.log("[close] reader.cancel error:", e && e.message || e); }
+    try {
+      if (s.reader) {
+        // In some Chromium/Web Serial states cancel() can stall for minutes
+        // while the device keeps emitting data. Bound teardown latency.
+        await withTimeout(s.reader.cancel(), 1000, "reader.cancel");
+      }
+    } catch (e) { console.log("[close] reader.cancel error:", e && e.message || e); }
     t = step("reader.cancel", t);
-    // Wait for the pump to fully unwind before releasing the lock.
-    try { if (s.pumpDone) await s.pumpDone; } catch (_) {}
+    // Wait briefly for the pump to unwind; don't block UI reset forever.
+    try {
+      if (s.pumpDone) await withTimeout(s.pumpDone, 1000, "pumpDone");
+    } catch (e) { console.log("[close] pumpDone error:", e && e.message || e); }
     t = step("pumpDone", t);
     try { if (s.reader) s.reader.releaseLock(); } catch (_) {}
-    try { await s.port.close(); }
-    catch (e) { console.log("[close] port.close error:", e && e.message || e); }
+    try {
+      // port.close() can also block waiting for stream shutdown on some
+      // browser/device combinations; bound it so UI can recover promptly.
+      await withTimeout(s.port.close(), 1000, "port.close");
+    } catch (e) { console.log("[close] port.close error:", e && e.message || e); }
     step("port.close", t);
     // eslint-disable-next-line no-console
     console.log("[close] total " + ((typeof performance !== "undefined" ? performance.now() : Date.now()) - t0).toFixed(0) + "ms");
