@@ -515,6 +515,14 @@
     if (!session) return;
     const s = session;
     session = null;
+    const t0 = (typeof performance !== "undefined" ? performance.now() : Date.now());
+    const step = (label, since) => {
+      const now = (typeof performance !== "undefined" ? performance.now() : Date.now());
+      // eslint-disable-next-line no-console
+      console.log("[close] " + label + " in " + (now - since).toFixed(0) + "ms");
+      return now;
+    };
+    let t = t0;
     try { s.abort.abort(); } catch (_) {}
     // Reject any in-flight waiter so the persistent pump's pending
     // .read() resolves cleanly when we cancel below.
@@ -523,12 +531,30 @@
       s.waiter = null;
       try { w.reject(new Error("cancelled")); } catch (_) {}
     }
+    // Abort the writable side BEFORE port.close(). port.close() blocks until
+    // both readable and writable streams are closed; if we only releaseLock()
+    // the writer (without closing/aborting it), Chromium can stall for many
+    // minutes trying to flush a UART that the firmware keeps spamming with
+    // log output. abort() discards pending writes — we've already received
+    // our result, so we don't care about flushing.
+    try {
+      if (s.writer) {
+        // releaseLock() first so abort() acts on the underlying stream.
+        try { s.writer.releaseLock(); } catch (_) {}
+      }
+    } catch (_) {}
+    try { if (s.port.writable) await s.port.writable.abort(); } catch (_) {}
+    t = step("writable.abort", t);
     try { if (s.reader) await s.reader.cancel(); } catch (_) {}
+    t = step("reader.cancel", t);
     // Wait for the pump to fully unwind before releasing the lock.
     try { if (s.pumpDone) await s.pumpDone; } catch (_) {}
+    t = step("pumpDone", t);
     try { if (s.reader) s.reader.releaseLock(); } catch (_) {}
-    try { if (s.writer) s.writer.releaseLock(); } catch (_) {}
     try { await s.port.close(); } catch (_) {}
+    step("port.close", t);
+    // eslint-disable-next-line no-console
+    console.log("[close] total " + ((typeof performance !== "undefined" ? performance.now() : Date.now()) - t0).toFixed(0) + "ms");
   }
 
   function makeSession(port) {
@@ -785,9 +811,13 @@
       }
       const kind   = result[1];   // "OK" or "ERR ..."
       if (kind === "OK") {
-        setStatus("Success. The ESP32 accepted the Wi-Fi details.");
+        setStatus("Success. The ESP32 accepted the Wi-Fi details. Closing port...");
       } else {
         const reason = (result[2] || "").trim() || "unknown";
+        // Show feedback BEFORE throwing — the surrounding finally awaits
+        // closeSession() which can take a moment, and an empty/stale status
+        // during that wait looks like a hang to the user.
+        setStatus("The ESP32 reported a failure: " + reason + ". Closing port...");
         throw new Error("The ESP32 reported a failure: " + reason);
       }
     } finally {
