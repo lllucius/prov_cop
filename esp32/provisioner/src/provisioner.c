@@ -44,7 +44,14 @@ static const char PROV_ERR_SFX[] = ">>\n";
 // VFS base path used when share_with_console is enabled. We only support a
 // single shared instance at a time (there is just one stdin to redirect).
 #define PROV_VFS_BASE_PATH "/dev/prov_console"
+// Size of the buffer that holds bytes destined for the redirected stdin.
+// 512 bytes comfortably exceeds typical console line lengths (incl. paste
+// of a long command) so a brief stall in the consumer does not lose data.
 #define PROV_STDIN_BUFFER_BYTES 512
+// How long to block when handing a byte off to the redirected stdin
+// before giving up. Kept short so a stuck consumer cannot wedge UART RX
+// (which would also stall in-flight provisioning frames).
+#define PROV_STDIN_SEND_TIMEOUT_MS 20
 
 // State machine for sharing the byte stream with the console.
 enum prov_share_state {
@@ -252,7 +259,8 @@ static void prov_forward(struct provisioner *p, const char *data, size_t n)
     // Non-blocking-ish push: if the consumer hasn't drained the buffer we
     // wait briefly, then drop the overflow rather than stalling the UART
     // reader (which would also stall any in-flight provisioning frame).
-    xStreamBufferSend(p->stdin_stream, data, n, pdMS_TO_TICKS(20));
+    xStreamBufferSend(p->stdin_stream, data, n,
+                      pdMS_TO_TICKS(PROV_STDIN_SEND_TIMEOUT_MS));
 }
 
 static void prov_forward_byte(struct provisioner *p, char c)
