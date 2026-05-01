@@ -336,6 +336,11 @@
   const alertEl   = $("alert");
   const logEl     = $("log");
   const clearLogBtn = $("clear-log-btn");
+  const RELOAD_NOTICE_KEY = "prov_reload_notice";
+  const RELOAD_SSID_KEY   = "prov_reload_ssid";
+  const RELOAD_PASS_KEY   = "prov_reload_pass";
+  const PREFLIGHT_RELOAD_KEY = "prov_preflight_reload";
+  let skipPreflightReload = false;
 
   // Log buffer cap: trim from the front when the on-page log grows past this
   // many characters, to avoid unbounded memory / DOM growth on long sessions.
@@ -345,6 +350,8 @@
     supportEl.hidden = false;
     sendBtn.disabled = true;
   }
+  restorePostReloadNotice();
+  handlePreflightReload();
 
   showPass.addEventListener("change", () => {
     passEl.type = showPass.checked ? "text" : "password";
@@ -372,6 +379,42 @@
   function setAlert(text) {
     alertEl.textContent = text;
     alertEl.hidden = false;
+  }
+
+  function restorePostReloadNotice() {
+    try {
+      const notice = sessionStorage.getItem(RELOAD_NOTICE_KEY);
+      if (!notice) return;
+      sessionStorage.removeItem(RELOAD_NOTICE_KEY);
+      const savedSsid = sessionStorage.getItem(RELOAD_SSID_KEY) || "";
+      const savedPass = sessionStorage.getItem(RELOAD_PASS_KEY) || "";
+      sessionStorage.removeItem(RELOAD_SSID_KEY);
+      sessionStorage.removeItem(RELOAD_PASS_KEY);
+      if (savedSsid) ssidEl.value = savedSsid;
+      if (savedPass) passEl.value = savedPass;
+      setStatus("Browser reset complete. Please click 'Send to ESP32' again.");
+      setAlert(notice);
+      alertEl.tabIndex = -1;
+      alertEl.focus();
+    } catch (_) {
+      // Ignore storage failures (private mode/policy); UX still works.
+    }
+  }
+
+
+  function handlePreflightReload() {
+    try {
+      if (sessionStorage.getItem(PREFLIGHT_RELOAD_KEY) !== "1") return;
+      sessionStorage.removeItem(PREFLIGHT_RELOAD_KEY);
+      skipPreflightReload = true;
+      const savedSsid = sessionStorage.getItem(RELOAD_SSID_KEY) || "";
+      const savedPass = sessionStorage.getItem(RELOAD_PASS_KEY) || "";
+      sessionStorage.removeItem(RELOAD_SSID_KEY);
+      sessionStorage.removeItem(RELOAD_PASS_KEY);
+      if (savedSsid) ssidEl.value = savedSsid;
+      if (savedPass) passEl.value = savedPass;
+      setStatus("Browser refreshed. Click 'Send to ESP32' to continue.");
+    } catch (_) {}
   }
 
   // ---- Encoding helpers ------------------------------------------------------
@@ -493,7 +536,28 @@
   }
   clearLogBtn.addEventListener("click", clearLog);
 
+  async function closePortBestEffort(port, timeoutMs) {
+    if (!port) return;
+    try {
+      await Promise.race([
+        port.close(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("close timeout")), timeoutMs)),
+      ]);
+    } catch (_) {
+      // Ignore: this is best-effort cleanup before opening/reopening.
+    }
+  }
+
   async function openPort() {
+    // If a previous close timed out, the browser can still consider a granted
+    // port open. Best-effort close all granted ports before prompting again.
+    try {
+      const granted = await navigator.serial.getPorts();
+      for (const p of granted) {
+        await closePortBestEffort(p, 250);
+      }
+    } catch (_) {}
+
     let port;
     try {
       port = await navigator.serial.requestPort();
@@ -501,13 +565,30 @@
       // User cancelled the chooser, or no device.
       throw new Error("No serial device was selected.");
     }
-    await port.open({
-      baudRate: BAUD,
-      dataBits: 8,
-      stopBits: 1,
-      parity:   "none",
-      flowControl: "none",
-    });
+    try {
+      await port.open({
+        baudRate: BAUD,
+        dataBits: 8,
+        stopBits: 1,
+        parity:   "none",
+        flowControl: "none",
+      });
+    } catch (e) {
+      const msg = e && e.message ? String(e.message) : String(e);
+      if (/already open/i.test(msg)) {
+        // One more targeted close/retry for the selected handle.
+        await closePortBestEffort(port, 1000);
+        await port.open({
+          baudRate: BAUD,
+          dataBits: 8,
+          stopBits: 1,
+          parity:   "none",
+          flowControl: "none",
+        });
+      } else {
+        throw e;
+      }
+    }
     return port;
   }
 
@@ -855,6 +936,25 @@
     }
   }
 
+
+  function reloadPageSoon(reason) {
+    setStatus(reason + " Refreshing the page to reset Web Serial state...");
+    try {
+      sessionStorage.setItem(RELOAD_NOTICE_KEY,
+        reason + " The page was refreshed to clear a stuck serial handle.");
+      sessionStorage.setItem(RELOAD_SSID_KEY, ssidEl.value || "");
+      sessionStorage.setItem(RELOAD_PASS_KEY, passEl.value || "");
+    } catch (_) {}
+    setTimeout(() => {
+      try {
+        window.location.reload();
+      } catch (_) {
+        // Fallback (equivalent full navigation to same URL).
+        window.location.href = window.location.href;
+      }
+    }, 800);
+  }
+
   // ---- Form handling ---------------------------------------------------------
   form.addEventListener("submit", async (ev) => {
     ev.preventDefault();
@@ -890,6 +990,17 @@
       return;
     }
 
+    if (!skipPreflightReload) {
+      try {
+        sessionStorage.setItem(PREFLIGHT_RELOAD_KEY, "1");
+        sessionStorage.setItem(RELOAD_SSID_KEY, ssid);
+        sessionStorage.setItem(RELOAD_PASS_KEY, pass);
+      } catch (_) {}
+      setStatus("Refreshing browser before opening Web Serial...");
+      setTimeout(() => { window.location.reload(); }, 50);
+      return;
+    }
+
     busy = true;
     try {
       await provision(ssid, pass);
@@ -903,6 +1014,12 @@
         // Move focus to the alert so JAWS users land on the failure message.
         alertEl.tabIndex = -1;
         alertEl.focus();
+
+        // If Chromium still thinks the handle is open, a full page reload
+        // is the most reliable recovery (equivalent to pressing F5).
+        if (/already open/i.test(msg)) {
+          reloadPageSoon("The serial port is still marked open.");
+        }
       }
     } finally {
       busy = false;
