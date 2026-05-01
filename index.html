@@ -222,6 +222,13 @@
     Ready. Fill in the Wi-Fi details above and select <strong>Send to ESP32</strong>.
   </div>
   <div
+    id="device"
+    class="status"
+    role="status"
+    aria-live="polite"
+    aria-atomic="true"
+    hidden></div>
+  <div
     id="alert"
     class="alert"
     role="alert"
@@ -239,6 +246,7 @@
     <ul>
       <li>Browser sends <code>&lt;&lt;PROV?&gt;&gt;</code> repeatedly to get the board's attention.</li>
       <li>ESP32 replies <code>&lt;&lt;PROV!&gt;&gt;</code> when ready.</li>
+      <li>ESP32 may also send <code>&lt;&lt;PROV:ID <em>name_b64</em>&gt;&gt;</code> with a human-readable device name.</li>
       <li>Browser sends <code>&lt;&lt;PROV:SET ssid_b64 pass_b64 crc16&gt;&gt;</code>.</li>
       <li>ESP32 replies <code>&lt;&lt;PROV:OK&gt;&gt;</code> on success or <code>&lt;&lt;PROV:ERR <em>reason</em>&gt;&gt;</code> on failure.</li>
     </ul>
@@ -257,10 +265,13 @@
   const BAUD            = 115200;
   const PROBE           = "<<PROV?>>\n";
   const READY_RE        = /<<PROV!>>/;
+  const ID_RE           = /<<PROV:ID\s+([A-Za-z0-9+/=]+)>>/;
   const RESULT_RE       = /<<PROV:(OK|ERR(?:\s+([^>]*))?)>>/;
   const PROBE_INTERVAL  = 500;  // ms
   const ATTENTION_TIMEO = 8000; // ms total to get a READY
+  const ID_GRACE_MS     = 200;  // additional time to wait for a follow-up ID frame
   const RESULT_TIMEO    = 30000; // ms to wait for OK/ERR after SET
+  const DEVICE_NAME_MAX = 64;   // mirror PROV_PROTO_MAX_NAME_LEN on the firmware
 
   // ---- DOM -------------------------------------------------------------------
   const $ = (id) => document.getElementById(id);
@@ -272,6 +283,7 @@
   const sendBtn   = $("send-btn");
   const cancelBtn = $("cancel-btn");
   const statusEl  = $("status");
+  const deviceEl  = $("device");
   const alertEl   = $("alert");
 
   if (!("serial" in navigator)) {
@@ -287,6 +299,17 @@
     // textContent prevents any HTML injection from device-supplied error tokens
     statusEl.textContent = text;
   }
+  function setDeviceName(name) {
+    if (!name) {
+      deviceEl.hidden = true;
+      deviceEl.textContent = "";
+      return;
+    }
+    // textContent prevents any HTML injection from device-supplied names.
+    deviceEl.textContent = "Connected to " + name + ".";
+    deviceEl.hidden = false;
+  }
+  function clearDeviceName() { setDeviceName(null); }
   function clearAlert() {
     alertEl.hidden = true;
     alertEl.textContent = "";
@@ -308,6 +331,24 @@
     let bin = "";
     for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
     return btoa(bin);
+  }
+  function base64ToUtf8(b64) {
+    // Decode a base64 string back to a UTF-8 JS string. Returns null on
+    // invalid input. Used for the device-name advertised by the ESP32.
+    let bin;
+    try { bin = atob(b64); } catch (_) { return null; }
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    try { return new TextDecoder("utf-8", { fatal: true }).decode(bytes); }
+    catch (_) { return null; }
+  }
+  function sanitiseDeviceName(s) {
+    // Strip control characters (incl. ANSI escapes) so a hostile or
+    // malformed device name cannot mess with the page.
+    if (!s) return "";
+    s = s.replace(/[\x00-\x1F\x7F]/g, "");
+    if (s.length > DEVICE_NAME_MAX) s = s.slice(0, DEVICE_NAME_MAX);
+    return s.trim();
   }
   function crc16ccitt(str) {
     // CRC-16/CCITT-FALSE: poly 0x1021, init 0xFFFF, no reflection, no xorout
@@ -435,6 +476,7 @@
   // ---- Main flow -------------------------------------------------------------
   async function provision(ssid, password) {
     clearAlert();
+    clearDeviceName();
     setStatus("Asking for permission to use the serial device...");
     const port = await openPort();
     session = makeSession(port);
@@ -461,6 +503,21 @@
           "The ESP32 did not respond. Check that the board is plugged in, " +
           "running the provisioning firmware, and not opened by another program."
         );
+      }
+
+      // Optional: the firmware may follow the READY with a <<PROV:ID ...>>
+      // frame announcing its human-readable name. Wait briefly for it but
+      // don't fail the flow if it never arrives (older firmware doesn't
+      // emit it).
+      try {
+        const idMatch = await waitForMatch(session, ID_RE, ID_GRACE_MS);
+        if (idMatch && idMatch[1]) {
+          const decoded = sanitiseDeviceName(base64ToUtf8(idMatch[1]));
+          if (decoded) setDeviceName(decoded);
+        }
+      } catch (e) {
+        if (e.message === "cancelled" || e.message === "serial port closed") throw e;
+        // Timeout: device didn't advertise a name, that's fine.
       }
 
       // Send credentials.

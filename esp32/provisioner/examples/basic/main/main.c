@@ -152,6 +152,9 @@ void app_main(void)
 
     provisioner_uart_config_t cfg = PROVISIONER_UART_CONFIG_DEFAULT();
     cfg.on_credentials = on_credentials;
+    // Human-readable name advertised to the web page after a probe so the
+    // user can confirm which board they are talking to. Free-form ASCII.
+    cfg.device_name    = "Basic Example Board";
 
     // The default config targets UART0, which on most ESP32 dev boards is
     // wired to the on-board USB-serial adapter that the web page connects
