@@ -127,6 +127,25 @@
     padding: 0.05rem 0.3rem;
     border-radius: 3px;
   }
+  #log {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.95rem;
+    white-space: pre-wrap;
+    word-break: break-all;
+    background: rgba(127,127,127,0.08);
+    border: 2px solid var(--border);
+    border-radius: 4px;
+    padding: 0.5rem 0.6rem;
+    margin: 0.5rem 0;
+    max-height: 18rem;
+    overflow: auto;
+    color: var(--fg);
+  }
+  #log:empty::before {
+    content: "(no traffic yet)";
+    color: var(--muted);
+    font-style: italic;
+  }
 </style>
 </head>
 <body>
@@ -244,6 +263,20 @@
     aria-atomic="true"
     hidden></div>
 
+  <h2>Log</h2>
+  <p class="hint" id="log-hint">
+    Raw serial traffic between this page and the ESP32. Lines are prefixed
+    with <code>[TX]</code> (sent) or <code>[RX]</code> (received).
+  </p>
+  <pre
+    id="log"
+    role="log"
+    aria-live="polite"
+    aria-atomic="false"
+    aria-describedby="log-hint"
+    tabindex="0"></pre>
+  <button type="button" id="clear-log-btn">Clear log</button>
+
   <details>
     <summary>How this works (for curious users and developers)</summary>
     <p>
@@ -295,6 +328,12 @@
   const statusEl  = $("status");
   const deviceEl  = $("device");
   const alertEl   = $("alert");
+  const logEl     = $("log");
+  const clearLogBtn = $("clear-log-btn");
+
+  // Log buffer cap: trim from the front when the on-page log grows past this
+  // many characters, to avoid unbounded memory / DOM growth on long sessions.
+  const LOG_MAX_CHARS = 64 * 1024;
 
   if (!("serial" in navigator)) {
     supportEl.hidden = false;
@@ -403,7 +442,50 @@
     // eslint-disable-next-line no-console
     console.log("%c[serial %s]%c %s", colour, direction, "color:inherit",
                 formatSerialChunk(text));
+    appendLog(direction, text);
   }
+
+  // ---- On-page log -----------------------------------------------------------
+  // Tracks whether the next character written to the log starts a new line,
+  // so we can prefix each line with [TX] / [RX]. Persists across calls
+  // because RX may arrive in chunks that don't align with newlines.
+  let logAtLineStart = true;
+
+  function appendLog(direction, text) {
+    // Prefix every line with [TX] / [RX] but otherwise emit raw bytes —
+    // newlines, carriage returns, and tabs render as themselves rather
+    // than escape sequences, per the user's request. Use textContent /
+    // createTextNode so the data is never interpreted as HTML.
+    const tag = "[" + direction + "] ";
+    let out = "";
+    for (let i = 0; i < text.length; i++) {
+      const ch = text[i];
+      if (logAtLineStart) {
+        out += tag;
+        logAtLineStart = false;
+      }
+      out += ch;
+      if (ch === "\n") logAtLineStart = true;
+    }
+    logEl.appendChild(document.createTextNode(out));
+
+    // Trim the front of the log if it has grown past the cap. textContent
+    // assignment rewrites the whole node in one shot, which keeps the DOM
+    // cheap regardless of how much we log.
+    const len = logEl.textContent.length;
+    if (len > LOG_MAX_CHARS) {
+      logEl.textContent = logEl.textContent.slice(len - LOG_MAX_CHARS);
+    }
+
+    // Autoscroll to the bottom so new traffic is visible.
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  function clearLog() {
+    logEl.textContent = "";
+    logAtLineStart = true;
+  }
+  clearLogBtn.addEventListener("click", clearLog);
 
   async function openPort() {
     let port;
