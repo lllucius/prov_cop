@@ -197,7 +197,6 @@
         autocomplete="off"
         autocapitalize="off"
         spellcheck="false"
-        maxlength="32"
         required
         aria-describedby="ssid-hint"
         aria-required="true">
@@ -215,7 +214,6 @@
         autocomplete="off"
         autocapitalize="off"
         spellcheck="false"
-        maxlength="63"
         aria-describedby="password-hint">
 
       <div class="checkbox-row">
@@ -339,8 +337,6 @@
   const RELOAD_NOTICE_KEY = "prov_reload_notice";
   const RELOAD_SSID_KEY   = "prov_reload_ssid";
   const RELOAD_PASS_KEY   = "prov_reload_pass";
-  const PREFLIGHT_RELOAD_KEY = "prov_preflight_reload";
-  let skipPreflightReload = false;
 
   // Log buffer cap: trim from the front when the on-page log grows past this
   // many characters, to avoid unbounded memory / DOM growth on long sessions.
@@ -351,7 +347,6 @@
     sendBtn.disabled = true;
   }
   restorePostReloadNotice();
-  handlePreflightReload();
 
   showPass.addEventListener("change", () => {
     passEl.type = showPass.checked ? "text" : "password";
@@ -399,22 +394,6 @@
     } catch (_) {
       // Ignore storage failures (private mode/policy); UX still works.
     }
-  }
-
-
-  function handlePreflightReload() {
-    try {
-      if (sessionStorage.getItem(PREFLIGHT_RELOAD_KEY) !== "1") return;
-      sessionStorage.removeItem(PREFLIGHT_RELOAD_KEY);
-      skipPreflightReload = true;
-      const savedSsid = sessionStorage.getItem(RELOAD_SSID_KEY) || "";
-      const savedPass = sessionStorage.getItem(RELOAD_PASS_KEY) || "";
-      sessionStorage.removeItem(RELOAD_SSID_KEY);
-      sessionStorage.removeItem(RELOAD_PASS_KEY);
-      if (savedSsid) ssidEl.value = savedSsid;
-      if (savedPass) passEl.value = savedPass;
-      setStatus("Browser refreshed. Click 'Send to ESP32' to continue.");
-    } catch (_) {}
   }
 
   // ---- Encoding helpers ------------------------------------------------------
@@ -578,13 +557,25 @@
       if (/already open/i.test(msg)) {
         // One more targeted close/retry for the selected handle.
         await closePortBestEffort(port, 1000);
-        await port.open({
-          baudRate: BAUD,
-          dataBits: 8,
-          stopBits: 1,
-          parity:   "none",
-          flowControl: "none",
-        });
+        try {
+          await port.open({
+            baudRate: BAUD,
+            dataBits: 8,
+            stopBits: 1,
+            parity:   "none",
+            flowControl: "none",
+          });
+        } catch (e2) {
+          const msg2 = e2 && e2.message ? String(e2.message) : String(e2);
+          if (/already open/i.test(msg2)) {
+            // Both close attempts failed. The browser's internal Web Serial
+            // state is stuck. A page reload is the only known recovery.
+            reloadPageSoon("The serial port could not be closed.");
+            // Throw so the caller's finally block runs (re-enables button etc.)
+            throw new Error("Reloading page to reset serial state.");
+          }
+          throw e2;
+        }
       } else {
         throw e;
       }
@@ -990,36 +981,12 @@
       return;
     }
 
-    if (!skipPreflightReload) {
-      try {
-        sessionStorage.setItem(PREFLIGHT_RELOAD_KEY, "1");
-        sessionStorage.setItem(RELOAD_SSID_KEY, ssid);
-        sessionStorage.setItem(RELOAD_PASS_KEY, pass);
-      } catch (_) {}
-      setStatus("Refreshing browser before opening Web Serial...");
-      setTimeout(() => { window.location.reload(); }, 50);
-      return;
-    }
-
     busy = true;
     try {
       await provision(ssid, pass);
-    } catch (err) {
-      const msg = err && err.message ? err.message : String(err);
-      if (msg === "cancelled") {
-        setStatus("Cancelled. You can try again.");
-      } else {
-        setStatus("Stopped.");
-        setAlert(msg);
-        // Move focus to the alert so JAWS users land on the failure message.
-        alertEl.tabIndex = -1;
-        alertEl.focus();
-
-        // If Chromium still thinks the handle is open, a full page reload
-        // is the most reliable recovery (equivalent to pressing F5).
-        if (/already open/i.test(msg)) {
-          reloadPageSoon("The serial port is still marked open.");
-        }
+    } catch (e) {
+      if (e.message !== "Reloading page to reset serial state.") {
+        setAlert(e.message || String(e));
       }
     } finally {
       busy = false;
