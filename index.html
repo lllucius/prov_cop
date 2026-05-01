@@ -160,7 +160,7 @@
       <label for="ssid">
         Network name (SSID)
         <span class="hint" id="ssid-hint">
-          The exact name of your Wi-Fi network. Maximum 32 characters.
+          The exact name of your Wi-Fi network. Maximum 32 UTF-8 bytes.
         </span>
       </label>
       <input
@@ -178,7 +178,7 @@
       <label for="password">
         Password
         <span class="hint" id="password-hint">
-          The Wi-Fi password. Leave blank only if the network is open. Maximum 63 characters.
+          The Wi-Fi password. Leave blank only if the network is open. Maximum 63 UTF-8 bytes.
         </span>
       </label>
       <input
@@ -297,8 +297,14 @@
   }
 
   // ---- Encoding helpers ------------------------------------------------------
+  function utf8Bytes(str) {
+    return new TextEncoder().encode(str);
+  }
+  function utf8ByteLength(str) {
+    return utf8Bytes(str).length;
+  }
   function utf8ToBase64(str) {
-    const bytes = new TextEncoder().encode(str);
+    const bytes = utf8Bytes(str);
     let bin = "";
     for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
     return btoa(bin);
@@ -500,13 +506,13 @@
       ssidEl.focus();
       return;
     }
-    if (ssid.length > 32) {
-      setAlert("The SSID must be 32 characters or fewer.");
+    if (utf8ByteLength(ssid) > 32) {
+      setAlert("The SSID must be 32 UTF-8 bytes or fewer.");
       ssidEl.focus();
       return;
     }
-    if (pass.length > 63) {
-      setAlert("The password must be 63 characters or fewer.");
+    if (utf8ByteLength(pass) > 63) {
+      setAlert("The password must be 63 UTF-8 bytes or fewer.");
       passEl.focus();
       return;
     }

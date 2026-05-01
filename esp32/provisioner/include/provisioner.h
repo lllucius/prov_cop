@@ -17,6 +17,8 @@
 // no xorout) computed over the ASCII string "<ssid_b64> <pass_b64>"
 // (the two base64 strings joined by exactly one space). pass_b64 may be
 // empty for an open Wi-Fi network.
+// Base64 and CRC are transport framing only, not secrecy or authentication;
+// treat provisioning as a local serial-access operation.
 //
 // Typical usage:
 //
@@ -184,7 +186,9 @@ esp_err_t provisioner_start_uart(const provisioner_uart_config_t* cfg,
 /**
  * Stop a previously started provisioner. Joins its task, releases any
  * resources allocated by the component (the UART driver itself is only
- * uninstalled if `install_driver` was true at start).
+ * uninstalled if `install_driver` was true at start). Returns
+ * ESP_ERR_TIMEOUT without freeing the handle if the task or shared-console
+ * readers do not quiesce in time; callers may retry later.
  */
 esp_err_t provisioner_stop(provisioner_handle_t h);
 

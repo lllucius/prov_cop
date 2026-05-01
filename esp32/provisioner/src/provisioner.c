@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/stream_buffer.h"
 #include "freertos/task.h"
 
@@ -52,6 +53,12 @@ static const char PROV_ERR_SFX[] = ">>\n";
 // before giving up. Kept short so a stuck consumer cannot wedge UART RX
 // (which would also stall in-flight provisioning frames).
 #define PROV_STDIN_SEND_TIMEOUT_MS 20
+// Shared-console stdin reads poll for shutdown so provisioner_stop() can
+// tear down the VFS without deleting a stream buffer under a blocked reader.
+#define PROV_STDIN_READ_POLL_MS 100
+// Maximum time provisioner_stop() waits for the background task or redirected
+// stdin readers to quiesce before returning ESP_ERR_TIMEOUT.
+#define PROV_STOP_TIMEOUT_MS 30000
 
 // State machine for sharing the byte stream with the console.
 enum prov_share_state
@@ -66,8 +73,9 @@ struct provisioner
 {
     provisioner_uart_config_t cfg; // copy of caller's config
     TaskHandle_t task;
-    volatile bool stop;
-    volatile bool running;
+    SemaphoreHandle_t task_done;
+    bool stop;
+    bool task_stopped;
     bool installed_driver;
     char line[PROV_LINE_MAX];
     size_t line_len;
@@ -76,6 +84,9 @@ struct provisioner
 
     // Console-sharing state. Only used when cfg.share_with_console is true.
     StreamBufferHandle_t stdin_stream;
+    SemaphoreHandle_t stdin_lock;
+    int stdin_readers;
+    bool stdin_closing;
     bool vfs_registered;
     int saved_stdin_fd; // -1 if no redirection
 };
@@ -136,8 +147,16 @@ static void prov_send_err(struct provisioner* p, const char* reason)
 // Base64 decode (mbedtls). Returns true on success and writes a NUL-terminated
 // string into `out` (size out_size, including NUL). Empty input yields "".
 // ---------------------------------------------------------------------------
-static bool prov_b64_decode(const char* in, size_t in_len, char* out, size_t out_size)
+static bool prov_b64_decode(const char* in,
+                            size_t in_len,
+                            char* out,
+                            size_t out_size,
+                            size_t* written_out)
 {
+    if (written_out)
+    {
+        *written_out = 0;
+    }
     if (in_len == 0)
     {
         if (out_size == 0)
@@ -146,6 +165,10 @@ static bool prov_b64_decode(const char* in, size_t in_len, char* out, size_t out
         }
         out[0] = '\0';
         return true;
+    }
+    if (out_size == 0)
+    {
+        return false;
     }
     size_t written = 0;
     int rc = mbedtls_base64_decode((unsigned char*)out,
@@ -157,7 +180,15 @@ static bool prov_b64_decode(const char* in, size_t in_len, char* out, size_t out
     {
         return false;
     }
+    if (memchr(out, '\0', written) != NULL)
+    {
+        return false;
+    }
     out[written] = '\0';
+    if (written_out)
+    {
+        *written_out = written;
+    }
     return true;
 }
 
@@ -229,20 +260,20 @@ static void prov_handle_set(struct provisioner* p, const char* args)
 
     char ssid[PROV_MAX_SSID_LEN + 1];
     char pass[PROV_MAX_PASS_LEN + 1];
+    size_t ssid_len = 0;
+    size_t pass_len = 0;
 
-    if (!prov_b64_decode(args, ssid_b64_len, ssid, sizeof ssid))
+    if (!prov_b64_decode(args, ssid_b64_len, ssid, sizeof ssid, &ssid_len))
     {
         prov_send_err(p, "b64ssid");
         return;
     }
-    if (!prov_b64_decode(s1 + 1, pass_b64_len, pass, sizeof pass))
+    if (!prov_b64_decode(s1 + 1, pass_b64_len, pass, sizeof pass, &pass_len))
     {
         prov_send_err(p, "b64pass");
         return;
     }
 
-    size_t ssid_len = strlen(ssid);
-    size_t pass_len = strlen(pass);
     if (ssid_len == 0 || ssid_len > PROV_MAX_SSID_LEN || pass_len > PROV_MAX_PASS_LEN)
     {
         prov_send_err(p, "length");
@@ -368,7 +399,7 @@ static void prov_feed(struct provisioner* p, const uint8_t* buf, size_t n)
                 p->line_len = 0;
                 continue;
             }
-            if (p->line_len + 1 > sizeof p->line)
+            if (p->line_len + 1 >= sizeof p->line)
             {
                 p->overflow = true;
                 continue;
@@ -455,7 +486,7 @@ static void prov_feed(struct provisioner* p, const uint8_t* buf, size_t n)
                     p->share_state = PSS_LINE_START;
                     break;
                 }
-                if (p->line_len + 1 > sizeof p->line)
+                if (p->line_len + 1 >= sizeof p->line)
                 {
                     // Frame too long to be ours -- flush what we have and
                     // pass the rest through.
@@ -512,7 +543,10 @@ static void prov_task(void* arg)
         }
     }
 
-    p->running = false;
+    if (p->task_done)
+    {
+        xSemaphoreGive(p->task_done);
+    }
     vTaskDelete(NULL);
 }
 
@@ -521,7 +555,7 @@ static void prov_task(void* arg)
 // ---------------------------------------------------------------------------
 static int prov_vfs_open(void* ctx, const char* path, int flags, int mode)
 {
-    (void)ctx;
+    struct provisioner* p = (struct provisioner*)ctx;
     (void)flags;
     (void)mode;
     // We expose a single device "/0" under our base path. Anything else
@@ -539,13 +573,26 @@ static int prov_vfs_open(void* ctx, const char* path, int flags, int mode)
         errno = ENOENT;
         return -1;
     }
+    if (p == NULL || p->stdin_lock == NULL)
+    {
+        errno = ENODEV;
+        return -1;
+    }
+    xSemaphoreTake(p->stdin_lock, portMAX_DELAY);
+    bool closing = p->stdin_closing;
+    xSemaphoreGive(p->stdin_lock);
+    if (closing)
+    {
+        errno = ENODEV;
+        return -1;
+    }
     return 0; // local fd = 0
 }
 
 static ssize_t prov_vfs_read(void* ctx, int fd, void* dst, size_t size)
 {
     struct provisioner* p = (struct provisioner*)ctx;
-    if (fd != 0 || p == NULL || p->stdin_stream == NULL)
+    if (fd != 0 || p == NULL || p->stdin_stream == NULL || p->stdin_lock == NULL)
     {
         errno = EBADF;
         return -1;
@@ -554,15 +601,35 @@ static ssize_t prov_vfs_read(void* ctx, int fd, void* dst, size_t size)
     {
         return 0;
     }
-    // Block until at least one byte is available, mirroring the semantics
-    // of a TTY read. Stdio layers above expect blocking reads from stdin.
-    size_t got = xStreamBufferReceive(p->stdin_stream, dst, size, portMAX_DELAY);
-    if (got == 0)
+    xSemaphoreTake(p->stdin_lock, portMAX_DELAY);
+    if (p->stdin_closing)
     {
-        // Should only happen if the stream buffer was deleted while we
-        // were blocked; treat as EOF.
+        xSemaphoreGive(p->stdin_lock);
         return 0;
     }
+    p->stdin_readers++;
+    xSemaphoreGive(p->stdin_lock);
+
+    size_t got = 0;
+    while (got == 0)
+    {
+        got = xStreamBufferReceive(p->stdin_stream, dst, size, pdMS_TO_TICKS(PROV_STDIN_READ_POLL_MS));
+        if (got > 0)
+        {
+            break;
+        }
+        xSemaphoreTake(p->stdin_lock, portMAX_DELAY);
+        bool closing = p->stdin_closing;
+        xSemaphoreGive(p->stdin_lock);
+        if (closing)
+        {
+            break;
+        }
+    }
+
+    xSemaphoreTake(p->stdin_lock, portMAX_DELAY);
+    p->stdin_readers--;
+    xSemaphoreGive(p->stdin_lock);
     return (ssize_t)got;
 }
 
@@ -614,9 +681,16 @@ static esp_err_t prov_console_share_setup(struct provisioner* p)
     }
 
     p->saved_stdin_fd = -1;
+    p->stdin_lock = xSemaphoreCreateMutex();
+    if (p->stdin_lock == NULL)
+    {
+        return ESP_ERR_NO_MEM;
+    }
     p->stdin_stream = xStreamBufferCreate(PROV_STDIN_BUFFER_BYTES, 1);
     if (p->stdin_stream == NULL)
     {
+        vSemaphoreDelete(p->stdin_lock);
+        p->stdin_lock = NULL;
         return ESP_ERR_NO_MEM;
     }
 
@@ -634,6 +708,8 @@ static esp_err_t prov_console_share_setup(struct provisioner* p)
         ESP_LOGE(TAG, "esp_vfs_register: %s", esp_err_to_name(err));
         vStreamBufferDelete(p->stdin_stream);
         p->stdin_stream = NULL;
+        vSemaphoreDelete(p->stdin_lock);
+        p->stdin_lock = NULL;
         return err;
     }
     p->vfs_registered = true;
@@ -655,6 +731,8 @@ static esp_err_t prov_console_share_setup(struct provisioner* p)
         s_share_instance = NULL;
         vStreamBufferDelete(p->stdin_stream);
         p->stdin_stream = NULL;
+        vSemaphoreDelete(p->stdin_lock);
+        p->stdin_lock = NULL;
         return ESP_FAIL;
     }
     p->saved_stdin_fd = dup(STDIN_FILENO); // may be -1 if no stdin yet
@@ -672,6 +750,8 @@ static esp_err_t prov_console_share_setup(struct provisioner* p)
         s_share_instance = NULL;
         vStreamBufferDelete(p->stdin_stream);
         p->stdin_stream = NULL;
+        vSemaphoreDelete(p->stdin_lock);
+        p->stdin_lock = NULL;
         return ESP_FAIL;
     }
     close(new_fd);
@@ -685,8 +765,36 @@ static esp_err_t prov_console_share_setup(struct provisioner* p)
     return ESP_OK;
 }
 
-static void prov_console_share_teardown(struct provisioner* p)
+static esp_err_t prov_console_share_teardown(struct provisioner* p)
 {
+    if (p->stdin_lock)
+    {
+        xSemaphoreTake(p->stdin_lock, portMAX_DELAY);
+        p->stdin_closing = true;
+        xSemaphoreGive(p->stdin_lock);
+
+        for (int i = 0; i < PROV_STOP_TIMEOUT_MS / PROV_STDIN_READ_POLL_MS; i++)
+        {
+            xSemaphoreTake(p->stdin_lock, portMAX_DELAY);
+            int readers = p->stdin_readers;
+            xSemaphoreGive(p->stdin_lock);
+            if (readers == 0)
+            {
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(PROV_STDIN_READ_POLL_MS));
+        }
+
+        xSemaphoreTake(p->stdin_lock, portMAX_DELAY);
+        int readers = p->stdin_readers;
+        xSemaphoreGive(p->stdin_lock);
+        if (readers != 0)
+        {
+            ESP_LOGE(TAG, "share_with_console: timed out waiting for stdin readers");
+            return ESP_ERR_TIMEOUT;
+        }
+    }
+
     if (p->saved_stdin_fd >= 0)
     {
         dup2(p->saved_stdin_fd, STDIN_FILENO);
@@ -700,16 +808,19 @@ static void prov_console_share_teardown(struct provisioner* p)
     }
     if (p->stdin_stream)
     {
-        // Wake any reader still blocked on the stream buffer so it can
-        // observe the now-restored fd.
-        xStreamBufferReset(p->stdin_stream);
         vStreamBufferDelete(p->stdin_stream);
         p->stdin_stream = NULL;
+    }
+    if (p->stdin_lock)
+    {
+        vSemaphoreDelete(p->stdin_lock);
+        p->stdin_lock = NULL;
     }
     if (s_share_instance == p)
     {
         s_share_instance = NULL;
     }
+    return ESP_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -735,6 +846,12 @@ esp_err_t provisioner_start_uart(const provisioner_uart_config_t* cfg, provision
     p->cfg = *cfg;
     p->saved_stdin_fd = -1;
     p->share_state = PSS_LINE_START;
+    p->task_done = xSemaphoreCreateBinary();
+    if (p->task_done == NULL)
+    {
+        free(p);
+        return ESP_ERR_NO_MEM;
+    }
     if (p->cfg.baud_rate <= 0)
     {
         p->cfg.baud_rate = 115200;
@@ -775,6 +892,7 @@ esp_err_t provisioner_start_uart(const provisioner_uart_config_t* cfg, provision
         if (err != ESP_OK)
         {
             ESP_LOGE(TAG, "uart_driver_install: %s", esp_err_to_name(err));
+            vSemaphoreDelete(p->task_done);
             free(p);
             return err;
         }
@@ -791,6 +909,7 @@ esp_err_t provisioner_start_uart(const provisioner_uart_config_t* cfg, provision
         {
             ESP_LOGE(TAG, "uart configure: %s", esp_err_to_name(err));
             uart_driver_delete(p->cfg.uart_num);
+            vSemaphoreDelete(p->task_done);
             free(p);
             return err;
         }
@@ -806,12 +925,12 @@ esp_err_t provisioner_start_uart(const provisioner_uart_config_t* cfg, provision
             {
                 uart_driver_delete(p->cfg.uart_num);
             }
+            vSemaphoreDelete(p->task_done);
             free(p);
             return err;
         }
     }
 
-    p->running = true;
     BaseType_t ok;
     if (p->cfg.task_core_id < 0)
     {
@@ -836,12 +955,13 @@ esp_err_t provisioner_start_uart(const provisioner_uart_config_t* cfg, provision
     {
         if (p->cfg.share_with_console)
         {
-            prov_console_share_teardown(p);
+            (void)prov_console_share_teardown(p);
         }
         if (p->installed_driver)
         {
             uart_driver_delete(p->cfg.uart_num);
         }
+        vSemaphoreDelete(p->task_done);
         free(p);
         return ESP_ERR_NO_MEM;
     }
@@ -859,20 +979,33 @@ esp_err_t provisioner_stop(provisioner_handle_t h)
     {
         return ESP_ERR_INVALID_ARG;
     }
-    h->stop = true;
-    // Wait briefly for the task to exit.
-    for (int i = 0; i < 100 && h->running; i++)
+    if (xTaskGetCurrentTaskHandle() == h->task)
     {
-        vTaskDelay(pdMS_TO_TICKS(10));
+        return ESP_ERR_INVALID_STATE;
+    }
+    h->stop = true;
+    if (!h->task_stopped)
+    {
+        if (xSemaphoreTake(h->task_done, pdMS_TO_TICKS(PROV_STOP_TIMEOUT_MS)) != pdTRUE)
+        {
+            ESP_LOGE(TAG, "timed out waiting for provisioner task to stop");
+            return ESP_ERR_TIMEOUT;
+        }
+        h->task_stopped = true;
     }
     if (h->cfg.share_with_console)
     {
-        prov_console_share_teardown(h);
+        esp_err_t err = prov_console_share_teardown(h);
+        if (err != ESP_OK)
+        {
+            return err;
+        }
     }
     if (h->installed_driver)
     {
         uart_driver_delete(h->cfg.uart_num);
     }
+    vSemaphoreDelete(h->task_done);
     free(h);
     return ESP_OK;
 }

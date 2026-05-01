@@ -116,12 +116,16 @@ stream.
 | ESP32 → Web  | `<<PROV:ERR <reason>>>`                                  | Failure (`reason` is a short token)|
 
 - `ssid_b64` and `pass_b64` are standard Base64 of the UTF-8 bytes of
-  the SSID and password. `pass_b64` may be empty for an open network.
+  the SSID and password. The decoded SSID must be 1..32 bytes, the
+  decoded password must be 0..63 bytes, and embedded NUL bytes are
+  rejected. `pass_b64` may be empty for an open network.
 - `crc16_hex` is four uppercase hex digits of CRC-16/CCITT-FALSE
   (polynomial `0x1021`, initial value `0xFFFF`, no reflection, no
   xorout) computed over the literal ASCII string
   `"<ssid_b64> <pass_b64>"` (the two Base64 strings joined by exactly
   one space).
+- Base64 and CRC framing are for transport robustness, not secrecy or
+  authentication. Treat provisioning as a local serial-access operation.
 
 The web page sends `<<PROV?>>` repeatedly until it sees `<<PROV!>>`
 (timeout: 8 s). After sending `<<PROV:SET ...>>` it waits up to 30 s
