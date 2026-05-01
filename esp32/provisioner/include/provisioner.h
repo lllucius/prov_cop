@@ -42,6 +42,35 @@
 // The component is non-intrusive: it only acts on lines beginning with
 // "<<" that match its frame format, so other code can keep using the same
 // UART for log output without conflicts.
+//
+// Sharing the UART with the IDF console
+// -------------------------------------
+//
+// On most ESP32 boards the on-board USB-serial bridge is wired to UART0,
+// which is also where the IDF console (`CONFIG_ESP_CONSOLE_UART`) lives.
+// The provisioner can co-exist with that console on the *same* UART by
+// setting `share_with_console = true` in `provisioner_uart_config_t`.
+//
+// In shared mode the provisioner takes ownership of the UART driver,
+// reads every byte that arrives, transparently consumes lines that match
+// its `<<PROV...>>` framing, and forwards everything else into a
+// filtered stdin device that the IDF console (or any other code reading
+// `stdin`) can read normally. Standard output keeps writing to the same
+// UART, so `printf()` and `ESP_LOGx()` continue to work unchanged.
+//
+// In shared mode the application must NOT install the IDF console such
+// that it tries to install or read the same UART driver itself. With
+// the default `CONFIG_ESP_CONSOLE_UART=y` this is fine -- the IDF
+// startup code only registers the stdio VFS, and the provisioner
+// supplies the actual byte stream. Custom REPLs that call
+// `esp_console_new_repl_uart()` re-install the UART driver and are
+// therefore incompatible with shared mode; such applications should put
+// the provisioner on a dedicated UART instead, or read `stdin`
+// directly (e.g. via `linenoise()`).
+//
+// Call `provisioner_start_uart()` *before* starting the console REPL or
+// before any code reads from `stdin`, so that stdin redirection is in
+// place by the time the first read happens.
 
 #ifndef PROV_COP_PROVISIONER_H
 #define PROV_COP_PROVISIONER_H
@@ -106,6 +135,14 @@ typedef struct {
                                         tskNO_AFFINITY (-1).                */
     provisioner_credentials_cb_t on_credentials; /**< Required.             */
     void       *user_ctx;          /**< Opaque pointer passed to callback.  */
+    bool        share_with_console;/**< If true, sniff `<<PROV...>>` frames
+                                        out of the byte stream and forward
+                                        everything else to `stdin` so the
+                                        IDF console can keep using the same
+                                        UART. Implies `install_driver=true`
+                                        and that no other code installs or
+                                        reads the UART driver. See header
+                                        comments for details.            */
 } provisioner_uart_config_t;
 
 /** Static initializer with safe defaults (fill in `on_credentials`). */
@@ -125,6 +162,7 @@ typedef struct {
         .task_core_id    = -1,                                           \
         .on_credentials  = NULL,                                         \
         .user_ctx        = NULL,                                         \
+        .share_with_console = false,                                     \
     })
 
 /**

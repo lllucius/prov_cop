@@ -3,17 +3,24 @@
 #include "provisioner.h"
 
 #include <ctype.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/stream_buffer.h"
 #include "freertos/task.h"
 
 #include "driver/uart.h"
+#include "driver/uart_vfs.h"
 #include "esp_check.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_vfs.h"
 #include "mbedtls/base64.h"
 
 static const char *TAG = "provisioner";
@@ -34,6 +41,19 @@ static const char PROV_OK[]      = "<<PROV:OK>>\n";
 static const char PROV_ERR_PFX[] = "<<PROV:ERR ";
 static const char PROV_ERR_SFX[] = ">>\n";
 
+// VFS base path used when share_with_console is enabled. We only support a
+// single shared instance at a time (there is just one stdin to redirect).
+#define PROV_VFS_BASE_PATH "/dev/prov_console"
+#define PROV_STDIN_BUFFER_BYTES 512
+
+// State machine for sharing the byte stream with the console.
+enum prov_share_state {
+    PSS_LINE_START = 0,   // start of a line; no bytes accumulated yet
+    PSS_GOT_ONE_LT,       // saw a single '<' at line start
+    PSS_BUFFER_FRAME,     // accumulating a possible "<<...>>" frame
+    PSS_PASSTHROUGH,      // forwarding bytes verbatim until next '\n'
+};
+
 struct provisioner {
     provisioner_uart_config_t cfg;     // copy of caller's config
     TaskHandle_t              task;
@@ -43,7 +63,16 @@ struct provisioner {
     char                      line[PROV_LINE_MAX];
     size_t                    line_len;
     bool                      overflow;
+    enum prov_share_state     share_state;
+
+    // Console-sharing state. Only used when cfg.share_with_console is true.
+    StreamBufferHandle_t      stdin_stream;
+    bool                      vfs_registered;
+    int                       saved_stdin_fd;   // -1 if no redirection
 };
+
+// Single shared instance pointer used by the VFS callbacks.
+static struct provisioner *s_share_instance;
 
 // ---------------------------------------------------------------------------
 // CRC-16/CCITT-FALSE
@@ -185,15 +214,18 @@ static void prov_handle_set(struct provisioner *p, const char *args)
     }
 }
 
-static void prov_handle_line(struct provisioner *p, char *line, size_t len)
+static bool prov_handle_line(struct provisioner *p, char *line, size_t len)
 {
-    // Only consider lines that look like our framing: "<<...>>".
-    if (len < 5 || line[0] != '<' || line[1] != '<') return;
+    // Only consider lines that look like our framing: "<<PROV...>>".
+    // Returns true if the line was a recognised provisioner frame and was
+    // consumed; false if the line should be passed through to the
+    // console (or simply discarded when not sharing).
+    if (len < 5 || line[0] != '<' || line[1] != '<') return false;
 
     if (len == sizeof(PROV_PROBE) - 1 &&
         memcmp(line, PROV_PROBE, len) == 0) {
         prov_write(p, PROV_READY);
-        return;
+        return true;
     }
 
     size_t pfx = sizeof(PROV_SET_PFX) - 1;
@@ -202,32 +234,158 @@ static void prov_handle_line(struct provisioner *p, char *line, size_t len)
         line[len - 1] == '>' && line[len - 2] == '>') {
         line[len - 2] = '\0';
         prov_handle_set(p, line + pfx);
-        return;
+        return true;
     }
-    // Other framed lines are silently ignored.
+    // Other framed lines are not ours.
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// Console-sharing helpers
+// ---------------------------------------------------------------------------
+static void prov_forward(struct provisioner *p, const char *data, size_t n)
+{
+    // Forward bytes to the redirected stdin if console sharing is enabled,
+    // otherwise drop them (preserves the historical "discard non-frame
+    // traffic" behaviour).
+    if (!p->cfg.share_with_console || !p->stdin_stream || n == 0) return;
+    // Non-blocking-ish push: if the consumer hasn't drained the buffer we
+    // wait briefly, then drop the overflow rather than stalling the UART
+    // reader (which would also stall any in-flight provisioning frame).
+    xStreamBufferSend(p->stdin_stream, data, n, pdMS_TO_TICKS(20));
+}
+
+static void prov_forward_byte(struct provisioner *p, char c)
+{
+    prov_forward(p, &c, 1);
 }
 
 static void prov_feed(struct provisioner *p, const uint8_t *buf, size_t n)
 {
+    // When sharing is disabled this collapses to the original behaviour:
+    // every byte is funnelled into p->line until '\n', then the line is
+    // examined and either acted on or silently dropped.
+    //
+    // When sharing is enabled we run a tiny state machine that buffers
+    // only candidate "<<..." frame openers; any byte that cannot be the
+    // start of one of our frames is forwarded to the console immediately,
+    // preserving interactive responsiveness for non-line-buffered
+    // consumers (e.g. linenoise).
+    const bool share = p->cfg.share_with_console;
+
     for (size_t i = 0; i < n; i++) {
         char c = (char)buf[i];
-        if (c == '\r') continue;
-        if (c == '\n') {
-            if (p->overflow) {
+
+        if (!share) {
+            // Original path: '\r' stripped, accumulate until '\n', then
+            // try to interpret. Anything else is dropped.
+            if (c == '\r') continue;
+            if (c == '\n') {
+                if (p->overflow) {
+                    p->line_len = 0;
+                    p->overflow = false;
+                    continue;
+                }
+                p->line[p->line_len] = '\0';
+                (void)prov_handle_line(p, p->line, p->line_len);
                 p->line_len = 0;
-                p->overflow = false;
                 continue;
             }
-            p->line[p->line_len] = '\0';
-            prov_handle_line(p, p->line, p->line_len);
-            p->line_len = 0;
+            if (p->line_len + 1 > sizeof p->line) {
+                p->overflow = true;
+                continue;
+            }
+            p->line[p->line_len++] = c;
             continue;
         }
-        if (p->line_len + 1 > sizeof p->line) {
-            p->overflow = true;
-            continue;
+
+        // ---- shared mode ----
+        switch (p->share_state) {
+        case PSS_LINE_START:
+            if (c == '<') {
+                p->line[0] = c;
+                p->line_len = 1;
+                p->share_state = PSS_GOT_ONE_LT;
+            } else if (c == '\n') {
+                prov_forward_byte(p, c);
+                // stay in PSS_LINE_START
+            } else {
+                prov_forward_byte(p, c);
+                p->share_state = PSS_PASSTHROUGH;
+            }
+            break;
+
+        case PSS_GOT_ONE_LT:
+            if (c == '<') {
+                p->line[1] = c;
+                p->line_len = 2;
+                p->overflow = false;
+                p->share_state = PSS_BUFFER_FRAME;
+            } else if (c == '\n') {
+                // "<\n" -- not a frame, flush.
+                prov_forward(p, p->line, p->line_len);
+                prov_forward_byte(p, c);
+                p->line_len = 0;
+                p->share_state = PSS_LINE_START;
+            } else {
+                prov_forward(p, p->line, p->line_len);
+                prov_forward_byte(p, c);
+                p->line_len = 0;
+                p->share_state = PSS_PASSTHROUGH;
+            }
+            break;
+
+        case PSS_BUFFER_FRAME:
+            if (c == '\r') {
+                // Match the historical behaviour: '\r' inside a frame is
+                // stripped so that CRLF and LF both work.
+                break;
+            }
+            if (c == '\n') {
+                if (p->overflow) {
+                    // Buffered prefix already flushed; just emit the '\n'
+                    // and reset.
+                    prov_forward_byte(p, c);
+                    p->line_len = 0;
+                    p->overflow = false;
+                    p->share_state = PSS_LINE_START;
+                    break;
+                }
+                p->line[p->line_len] = '\0';
+                bool consumed = prov_handle_line(p, p->line, p->line_len);
+                if (!consumed) {
+                    // Not one of ours; replay the line to the console.
+                    prov_forward(p, p->line, p->line_len);
+                    prov_forward_byte(p, '\n');
+                }
+                p->line_len = 0;
+                p->share_state = PSS_LINE_START;
+                break;
+            }
+            if (p->line_len + 1 > sizeof p->line) {
+                // Frame too long to be ours -- flush what we have and
+                // pass the rest through.
+                if (!p->overflow) {
+                    prov_forward(p, p->line, p->line_len);
+                    p->overflow = true;
+                }
+                prov_forward_byte(p, c);
+                p->share_state = PSS_PASSTHROUGH;
+                break;
+            }
+            p->line[p->line_len++] = c;
+            break;
+
+        case PSS_PASSTHROUGH:
+        default:
+            prov_forward_byte(p, c);
+            if (c == '\n') {
+                p->line_len = 0;
+                p->overflow = false;
+                p->share_state = PSS_LINE_START;
+            }
+            break;
         }
-        p->line[p->line_len++] = c;
     }
 }
 
@@ -258,6 +416,162 @@ static void prov_task(void *arg)
 }
 
 // ---------------------------------------------------------------------------
+// VFS for redirected stdin (only used when share_with_console is true)
+// ---------------------------------------------------------------------------
+static int prov_vfs_open(void *ctx, const char *path, int flags, int mode)
+{
+    (void)ctx; (void)flags; (void)mode;
+    // We expose a single device "/0" under our base path. Anything else
+    // is rejected.
+    if (path == NULL) return -1;
+    if (path[0] == '/') path++;
+    if (strcmp(path, "0") != 0) {
+        errno = ENOENT;
+        return -1;
+    }
+    return 0;   // local fd = 0
+}
+
+static ssize_t prov_vfs_read(void *ctx, int fd, void *dst, size_t size)
+{
+    struct provisioner *p = (struct provisioner *)ctx;
+    if (fd != 0 || p == NULL || p->stdin_stream == NULL) {
+        errno = EBADF;
+        return -1;
+    }
+    if (size == 0) return 0;
+    // Block until at least one byte is available, mirroring the semantics
+    // of a TTY read. Stdio layers above expect blocking reads from stdin.
+    size_t got = xStreamBufferReceive(p->stdin_stream, dst, size,
+                                      portMAX_DELAY);
+    if (got == 0) {
+        // Should only happen if the stream buffer was deleted while we
+        // were blocked; treat as EOF.
+        return 0;
+    }
+    return (ssize_t)got;
+}
+
+static int prov_vfs_close(void *ctx, int fd)
+{
+    (void)ctx;
+    if (fd != 0) { errno = EBADF; return -1; }
+    return 0;
+}
+
+static int prov_vfs_fstat(void *ctx, int fd, struct stat *st)
+{
+    (void)ctx;
+    if (fd != 0 || st == NULL) { errno = EBADF; return -1; }
+    memset(st, 0, sizeof *st);
+    st->st_mode = S_IFCHR;     // character device, like a TTY
+    return 0;
+}
+
+static int prov_vfs_fcntl(void *ctx, int fd, int cmd, int arg)
+{
+    (void)ctx; (void)cmd; (void)arg;
+    if (fd != 0) { errno = EBADF; return -1; }
+    // No-op: we don't honour O_NONBLOCK, but report success so callers
+    // (including newlib's stdio init) don't fail outright.
+    return 0;
+}
+
+static esp_err_t prov_console_share_setup(struct provisioner *p)
+{
+    if (s_share_instance != NULL) {
+        ESP_LOGE(TAG, "share_with_console: another instance already active");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    p->saved_stdin_fd = -1;
+    p->stdin_stream = xStreamBufferCreate(PROV_STDIN_BUFFER_BYTES, 1);
+    if (p->stdin_stream == NULL) return ESP_ERR_NO_MEM;
+
+    static const esp_vfs_t vfs = {
+        .flags    = ESP_VFS_FLAG_CONTEXT_PTR,
+        .open_p   = prov_vfs_open,
+        .read_p   = prov_vfs_read,
+        .close_p  = prov_vfs_close,
+        .fstat_p  = prov_vfs_fstat,
+        .fcntl_p  = prov_vfs_fcntl,
+    };
+    esp_err_t err = esp_vfs_register(PROV_VFS_BASE_PATH, &vfs, p);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_vfs_register: %s", esp_err_to_name(err));
+        vStreamBufferDelete(p->stdin_stream);
+        p->stdin_stream = NULL;
+        return err;
+    }
+    p->vfs_registered = true;
+    s_share_instance = p;
+
+    // Route stdout/stderr through the UART driver so that prints from the
+    // application (and from this component) coexist with the driver TX
+    // path we now own.
+    uart_vfs_dev_use_driver((int)p->cfg.uart_num);
+
+    // Replace stdin with our filtered device. We dup() the existing fd 0
+    // first so we can restore it on stop.
+    int new_fd = open(PROV_VFS_BASE_PATH "/0", O_RDONLY);
+    if (new_fd < 0) {
+        ESP_LOGE(TAG, "open %s: %d", PROV_VFS_BASE_PATH "/0", errno);
+        esp_vfs_unregister(PROV_VFS_BASE_PATH);
+        p->vfs_registered = false;
+        s_share_instance = NULL;
+        vStreamBufferDelete(p->stdin_stream);
+        p->stdin_stream = NULL;
+        return ESP_FAIL;
+    }
+    p->saved_stdin_fd = dup(STDIN_FILENO);   // may be -1 if no stdin yet
+    if (dup2(new_fd, STDIN_FILENO) < 0) {
+        ESP_LOGE(TAG, "dup2 stdin: %d", errno);
+        close(new_fd);
+        if (p->saved_stdin_fd >= 0) close(p->saved_stdin_fd);
+        p->saved_stdin_fd = -1;
+        esp_vfs_unregister(PROV_VFS_BASE_PATH);
+        p->vfs_registered = false;
+        s_share_instance = NULL;
+        vStreamBufferDelete(p->stdin_stream);
+        p->stdin_stream = NULL;
+        return ESP_FAIL;
+    }
+    close(new_fd);
+
+    // Make sure stdio reads are unbuffered so a single-byte feed wakes the
+    // console immediately. The IDF console normally does this itself but
+    // we may run before it.
+    setvbuf(stdin, NULL, _IONBF, 0);
+
+    ESP_LOGI(TAG, "share_with_console: stdin redirected via %s",
+             PROV_VFS_BASE_PATH);
+    return ESP_OK;
+}
+
+static void prov_console_share_teardown(struct provisioner *p)
+{
+    if (p->saved_stdin_fd >= 0) {
+        dup2(p->saved_stdin_fd, STDIN_FILENO);
+        close(p->saved_stdin_fd);
+        p->saved_stdin_fd = -1;
+    }
+    if (p->vfs_registered) {
+        esp_vfs_unregister(PROV_VFS_BASE_PATH);
+        p->vfs_registered = false;
+    }
+    if (p->stdin_stream) {
+        // Wake any reader still blocked on the stream buffer so it can
+        // observe the now-restored fd.
+        xStreamBufferReset(p->stdin_stream);
+        vStreamBufferDelete(p->stdin_stream);
+        p->stdin_stream = NULL;
+    }
+    if (s_share_instance == p) {
+        s_share_instance = NULL;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 esp_err_t provisioner_start_uart(const provisioner_uart_config_t *cfg,
@@ -266,13 +580,23 @@ esp_err_t provisioner_start_uart(const provisioner_uart_config_t *cfg,
     ESP_RETURN_ON_FALSE(cfg != NULL, ESP_ERR_INVALID_ARG, TAG, "cfg null");
     ESP_RETURN_ON_FALSE(cfg->on_credentials != NULL, ESP_ERR_INVALID_ARG,
                         TAG, "on_credentials required");
+    ESP_RETURN_ON_FALSE(!cfg->share_with_console || cfg->install_driver,
+                        ESP_ERR_INVALID_ARG, TAG,
+                        "share_with_console requires install_driver=true");
 
     struct provisioner *p = calloc(1, sizeof *p);
     if (!p) return ESP_ERR_NO_MEM;
     p->cfg = *cfg;
+    p->saved_stdin_fd = -1;
+    p->share_state = PSS_LINE_START;
     if (p->cfg.baud_rate       <= 0)  p->cfg.baud_rate       = 115200;
     if (p->cfg.task_stack_size == 0)  p->cfg.task_stack_size = 4096;
     if (p->cfg.rx_buffer_size  == 0)  p->cfg.rx_buffer_size  = 1024;
+    // In shared mode prints have to flow through the driver, so we need a
+    // TX buffer to avoid blocking the application on the UART FIFO.
+    if (p->cfg.share_with_console && p->cfg.tx_buffer_size == 0) {
+        p->cfg.tx_buffer_size = 256;
+    }
 
     esp_err_t err = ESP_OK;
 
@@ -309,6 +633,15 @@ esp_err_t provisioner_start_uart(const provisioner_uart_config_t *cfg,
         p->installed_driver = true;
     }
 
+    if (p->cfg.share_with_console) {
+        err = prov_console_share_setup(p);
+        if (err != ESP_OK) {
+            if (p->installed_driver) uart_driver_delete(p->cfg.uart_num);
+            free(p);
+            return err;
+        }
+    }
+
     p->running = true;
     BaseType_t ok;
     if (p->cfg.task_core_id < 0) {
@@ -323,6 +656,7 @@ esp_err_t provisioner_start_uart(const provisioner_uart_config_t *cfg,
                                      &p->task, p->cfg.task_core_id);
     }
     if (ok != pdPASS) {
+        if (p->cfg.share_with_console) prov_console_share_teardown(p);
         if (p->installed_driver) uart_driver_delete(p->cfg.uart_num);
         free(p);
         return ESP_ERR_NO_MEM;
@@ -339,6 +673,9 @@ esp_err_t provisioner_stop(provisioner_handle_t h)
     // Wait briefly for the task to exit.
     for (int i = 0; i < 100 && h->running; i++) {
         vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    if (h->cfg.share_with_console) {
+        prov_console_share_teardown(h);
     }
     if (h->installed_driver) {
         uart_driver_delete(h->cfg.uart_num);

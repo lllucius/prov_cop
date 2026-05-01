@@ -83,11 +83,23 @@ output from the rest of your project on the same UART.
 
 > **Note on UART sharing.** On most ESP32 boards UART0 is wired to the
 > on-board USB-serial bridge — that is what the web page connects to.
-> The default IDF console also uses UART0. If you want the provisioner
-> to install the UART driver itself, set `CONFIG_ESP_CONSOLE_NONE=y` or
-> `CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y` in `menuconfig` so the console
-> does not claim it. Otherwise pick a dedicated UART (e.g. `UART_NUM_1`
-> with explicit pins) for the provisioner.
+> The default IDF console also uses UART0. There are two ways to handle
+> this:
+>
+> - **Dedicated UART or no console.** Set `CONFIG_ESP_CONSOLE_NONE=y` /
+>   `CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y` so the IDF console does not
+>   claim UART0, or pick a separate UART (e.g. `UART_NUM_1` with explicit
+>   pins) for the provisioner.
+> - **Share the UART with the IDF console.** Set
+>   `cfg.share_with_console = true`. The provisioner will install the
+>   UART driver itself, sniff `<<PROV…>>` frames out of the byte stream,
+>   and forward everything else to a redirected `stdin` so the IDF
+>   console (or any code reading `stdin`) keeps working on the same
+>   wire. Standard output is unchanged. Call `provisioner_start_uart()`
+>   *before* starting any console REPL or reading from `stdin`. This
+>   mode is incompatible with REPLs that re-install the UART driver
+>   themselves (e.g. `esp_console_new_repl_uart()`); for those, prefer a
+>   dedicated UART.
 
 ## Wire protocol
 
