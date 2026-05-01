@@ -312,6 +312,9 @@
   const ATTENTION_TIMEO = 8000; // ms total to get a READY
   const ID_GRACE_MS     = 200;  // additional time to wait for a follow-up ID frame
   const RESULT_TIMEO    = 30000; // ms to wait for OK/ERR after SET
+  // Diagnostic logging in the devtools console. Cheap and non-intrusive;
+  // leave on so users can attach the console output to bug reports.
+  const DEBUG           = true;
   const DEVICE_NAME_MAX = 64;   // matches PROV_PROTO_MAX_NAME_LEN in the
                                 // firmware (esp32/provisioner/src/provisioner_proto.h).
                                 // Keep these in sync if the firmware constant changes.
@@ -551,17 +554,33 @@
           if (done) break;
           if (!value || !value.byteLength) continue;
           const chunk = s.decoder.decode(value, { stream: true });
-          logSerial("RX", chunk);
+          // IMPORTANT: update the parse buffer BEFORE calling logSerial.
+          // If anything in the on-page logger ever threw (e.g. a DOM
+          // exception), the outer try/catch would otherwise silently
+          // exit the pump and the bytes would be lost — leaving any
+          // active waiter to time out even though the data arrived.
           s.buffer += chunk;
           // Cap buffer size to protect against runaway input.
           if (s.buffer.length > 8192) {
             s.buffer = s.buffer.slice(-4096);
           }
+          // Logging may throw on unusual content; swallow so it can't
+          // break the protocol pump.
+          try { logSerial("RX", chunk); } catch (e) {
+            // eslint-disable-next-line no-console
+            console.error("logSerial(RX) threw:", e);
+          }
+          if (DEBUG) {
+            // eslint-disable-next-line no-console
+            console.debug("[pump] +%d bytes, buffer=%d, waiter=%s",
+              chunk.length, s.buffer.length,
+              s.waiter ? s.waiter.re.source : "(none)");
+          }
           tryDeliver(s);
         }
-      } catch (_) {
-        // Pump exits on reader.cancel() or stream error; waiter cleanup
-        // is handled by closeSession / abort handlers.
+      } catch (e) {
+        // eslint-disable-next-line no-console
+        console.error("[pump] exited on error:", e);
       }
     })();
 
@@ -573,11 +592,42 @@
   function tryDeliver(s) {
     if (!s.waiter) return;
     const m = s.waiter.re.exec(s.buffer);
-    if (!m) return;
+    if (!m) {
+      if (DEBUG) {
+        // eslint-disable-next-line no-console
+        console.debug("[tryDeliver] no match for /%s/, buffer=%s",
+          s.waiter.re.source, escapeForDebug(s.buffer));
+      }
+      return;
+    }
+    if (DEBUG) {
+      // eslint-disable-next-line no-console
+      console.debug("[tryDeliver] match /%s/ -> %s",
+        s.waiter.re.source, JSON.stringify(m[0]));
+    }
     s.buffer = s.buffer.slice(m.index + m[0].length);
     const w = s.waiter;
     s.waiter = null;
     w.resolve(m);
+  }
+
+  // Compact, copy-pasteable representation of a buffer for diagnostic logs:
+  // shows control bytes as escapes and truncates long buffers.
+  function escapeForDebug(s) {
+    if (!s) return JSON.stringify(s);
+    const max = 200;
+    const slice = s.length > max ? s.slice(-max) : s;
+    let out = "";
+    for (let i = 0; i < slice.length; i++) {
+      const c = slice.charCodeAt(i);
+      if (c === 0x0A) out += "\\n";
+      else if (c === 0x0D) out += "\\r";
+      else if (c === 0x09) out += "\\t";
+      else if (c < 0x20 || c === 0x7F) out += "\\x" + c.toString(16).padStart(2, "0");
+      else out += slice[i];
+    }
+    return (s.length > max ? "…(" + s.length + " total)…" : "") +
+           '"' + out + '"';
   }
 
   async function sendLine(s, line) {
@@ -593,9 +643,19 @@
   // strictly sequential), which matches our usage.
   function waitForMatch(s, matchRe, timeoutMs) {
     return new Promise((resolve, reject) => {
+      if (DEBUG) {
+        // eslint-disable-next-line no-console
+        console.debug("[waitForMatch] waiting for /%s/ (timeout %dms), buffer=%s",
+          matchRe.source, timeoutMs, escapeForDebug(s.buffer));
+      }
       // Fast path: buffer already contains a match.
       const existing = matchRe.exec(s.buffer);
       if (existing) {
+        if (DEBUG) {
+          // eslint-disable-next-line no-console
+          console.debug("[waitForMatch] fast-path match /%s/ -> %s",
+            matchRe.source, JSON.stringify(existing[0]));
+        }
         s.buffer = s.buffer.slice(existing.index + existing[0].length);
         resolve(existing);
         return;
@@ -619,7 +679,17 @@
       w.reject  = (e) => { cleanup(); reject(e); };
       w.timer   = setTimeout(() => {
         cleanup();
-        reject(new Error("timeout"));
+        // Surface the buffer state in the rejection so the user can see
+        // what the firmware actually sent when matching failed.
+        const snap = escapeForDebug(s.buffer);
+        if (DEBUG) {
+          // eslint-disable-next-line no-console
+          console.warn("[waitForMatch] TIMEOUT for /%s/ after %dms, buffer=%s",
+            matchRe.source, timeoutMs, snap);
+        }
+        const err = new Error("timeout");
+        err.buffer = snap;
+        reject(err);
       }, timeoutMs);
 
       s.abort.signal.addEventListener("abort", onAbort, { once: true });
@@ -684,7 +754,19 @@
 
       // Wait for result.
       setStatus("Waiting for the ESP32 to confirm...");
-      const result = await waitForMatch(session, RESULT_RE, RESULT_TIMEO);
+      let result;
+      try {
+        result = await waitForMatch(session, RESULT_RE, RESULT_TIMEO);
+      } catch (e) {
+        if (e && e.message === "timeout") {
+          throw new Error(
+            "The ESP32 did not return a recognisable result within " +
+            (RESULT_TIMEO / 1000) + "s. Last bytes received: " +
+            (e.buffer || "(none)")
+          );
+        }
+        throw e;
+      }
       const kind   = result[1];   // "OK" or "ERR ..."
       if (kind === "OK") {
         setStatus("Success. The ESP32 accepted the Wi-Fi details.");
