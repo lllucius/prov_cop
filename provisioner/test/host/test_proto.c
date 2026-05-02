@@ -1,6 +1,6 @@
 // Host-side unit tests for the prov_cop protocol parser.
 //
-// Builds against esp32/provisioner/src/provisioner_proto.[ch] plus a tiny
+// Builds against provisioner/src/provisioner_proto.[ch] plus a tiny
 // mbedtls/base64 stub. Has no ESP-IDF or FreeRTOS dependency.
 
 #include <assert.h>

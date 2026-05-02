@@ -11,7 +11,7 @@ It has two parts:
    reader (and other AT) using semantic HTML, real `<label>`s,
    `aria-live` regions, and visible focus styles.
 
-2. **`esp32/provisioner/`** — a drop-in **ESP-IDF v6** component that
+2. **`provisioner/`** — a drop-in **ESP-IDF v6** component that
    sits in the background watching for the provisioning protocol on a
    UART (typically the one wired to the on-board USB-serial bridge).
    When valid credentials arrive, it hands them to a callback in the
@@ -40,7 +40,7 @@ status region announces progress and the final result.
 ## Using the ESP32 component
 
 The component targets **ESP-IDF v6**. Add it to your project as a
-component (e.g. copy or symlink `esp32/provisioner/` into your project's
+component (e.g. copy or symlink `provisioner/` into your project's
 `components/` directory, or reference it through
 `EXTRA_COMPONENT_DIRS`), then in your application:
 
@@ -71,13 +71,13 @@ When `device_name` is set, the web page displays
 user can confirm which board they are talking to.
 
 A complete project is in
-[`esp32/provisioner/examples/basic/`](esp32/provisioner/examples/basic/),
+[`provisioner/examples/basic/`](provisioner/examples/basic/),
 and a second one demonstrating
-[`share_with_console`](esp32/provisioner/examples/shared_console/) on the
+[`share_with_console`](provisioner/examples/shared_console/) on the
 same UART as the IDF console:
 
 ```sh
-cd esp32/provisioner/examples/basic
+cd provisioner/examples/basic
 idf.py set-target esp32
 idf.py build flash monitor
 ```
@@ -165,7 +165,7 @@ for `<<PROV:OK>>` or `<<PROV:ERR ...>>`.
 
 ```
 index.html                                 Provisioning web page
-esp32/provisioner/                         ESP-IDF v6 component
+provisioner/                               ESP-IDF v6 component
   CMakeLists.txt                           idf_component_register
   Kconfig                                  menuconfig defaults
   idf_component.yml                        Component manifest
@@ -178,7 +178,7 @@ esp32/provisioner/                         ESP-IDF v6 component
   test/host/                               Host-side unit tests for the
                                            protocol parser (no IDF
                                            required; run with `cmake -S
-                                           esp32/provisioner/test/host -B
+                                           provisioner/test/host -B
                                            build && cmake --build build &&
                                            ctest --test-dir build`)
 ```

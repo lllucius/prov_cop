@@ -3,7 +3,7 @@
 //
 // Build with ESP-IDF v6:
 //
-//   cd esp32/provisioner/examples/basic
+//   cd provisioner/examples/basic
 //   idf.py set-target esp32
 //   idf.py build flash monitor
 //

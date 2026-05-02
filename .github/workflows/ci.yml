@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Configure
-        run: cmake -S esp32/provisioner/test/host -B build/host
+        run: cmake -S provisioner/test/host -B build/host
       - name: Build
         run: cmake --build build/host
       - name: Test
@@ -36,4 +36,4 @@ jobs:
         with:
           esp_idf_version: v5.3.1
           target: ${{ matrix.target }}
-          path: esp32/provisioner/examples/basic
+          path: provisioner/examples/basic
