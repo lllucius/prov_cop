@@ -207,6 +207,8 @@ class ProvisionWorker(QThread):
         """Open the serial port and execute the provisioning sequence."""
         self.statusChanged.emit(f"Opening serial port {self._port_name} ...")
         try:
+            # Create the Serial object without a port so it is not opened
+            # immediately; we need to set dtr/rts before the physical open.
             ser = serial.Serial(
                 baudrate=BAUD,
                 bytesize=serial.EIGHTBITS,
