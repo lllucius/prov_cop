@@ -225,6 +225,14 @@ class ProvisionWorker(QThread):
             ser.rts = False
             ser.port = self._port_name
             ser.open()
+            # Discard any bytes that were left in the OS receive buffer from a
+            # previous session. Without this, stale <<PROV:ERR>> or <<PROV:OK>>
+            # frames can end up in buf during the attention phase and cause the
+            # result-wait fast-path to match them before any real data arrives.
+            try:
+                ser.reset_input_buffer()
+            except Exception:  # pylint: disable=broad-except
+                pass
         except serial.SerialException as exc:
             raise RuntimeError(
                 f"Could not open serial port {self._port_name}: {exc}"
@@ -277,6 +285,15 @@ class ProvisionWorker(QThread):
                 pass
 
         # --- Send credentials ------------------------------------------------
+        # Discard everything accumulated in the software buffer and the OS
+        # receive buffer before we send SET. Any bytes that arrived before SET
+        # (including stale frames from a prior provisioning attempt or ESP32
+        # boot messages) are irrelevant to the result we are about to wait for.
+        buf.clear()
+        try:
+            ser.reset_input_buffer()
+        except Exception:  # pylint: disable=broad-except
+            pass
         self.statusChanged.emit("ESP32 is ready. Sending Wi-Fi details ...")
         ssid_b64 = base64.b64encode(self._ssid.encode("utf-8")).decode("ascii")
         pass_b64 = base64.b64encode(self._password.encode("utf-8")).decode("ascii")
