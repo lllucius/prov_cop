@@ -40,7 +40,10 @@ Run with::
 from __future__ import annotations
 
 import base64
+import os
 import re
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -146,6 +149,82 @@ def list_serial_ports() -> list[PortInfo]:
     ports = [PortInfo(p.device, p.description or "") for p in list_ports.comports()]
     ports.sort(key=lambda p: p.device)
     return ports
+
+
+def list_wifi_ssids() -> list[str]:
+    """Return visible Wi-Fi network names, best-effort and de-duplicated."""
+    if sys.platform.startswith("win"):
+        ssids = _scan_windows_ssids()
+    elif sys.platform == "darwin":
+        ssids = _scan_macos_ssids()
+    else:
+        ssids = _scan_linux_ssids()
+    return sorted({ssid for ssid in ssids if ssid}, key=str.casefold)
+
+
+def _run_scan_command(args: list[str]) -> str:
+    """Run an OS Wi-Fi scan command and return stdout, or ``""`` on failure."""
+    try:
+        proc = subprocess.run(
+            args,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return proc.stdout
+
+
+def _scan_windows_ssids() -> list[str]:
+    """List visible SSIDs using Windows ``netsh``."""
+    if shutil.which("netsh") is None:
+        return []
+    output = _run_scan_command(["netsh", "wlan", "show", "networks", "mode=bssid"])
+    ssids: list[str] = []
+    for line in output.splitlines():
+        match = re.match(r"\s*SSID\s+\d+\s*:\s*(.*)\s*$", line)
+        if match:
+            ssids.append(match.group(1).strip())
+    return ssids
+
+
+def _scan_macos_ssids() -> list[str]:
+    """List visible SSIDs using macOS's airport scanner."""
+    airport = (
+        "/System/Library/PrivateFrameworks/Apple80211.framework"
+        "/Versions/Current/Resources/airport"
+    )
+    if not os.path.exists(airport):
+        return []
+    output = _run_scan_command([airport, "-s"])
+    ssids: list[str] = []
+    bssid_re = re.compile(r"\s+(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}\s+")
+    for line in output.splitlines()[1:]:
+        match = bssid_re.search(line)
+        if match:
+            ssids.append(line[: match.start()].strip())
+    return ssids
+
+
+def _scan_linux_ssids() -> list[str]:
+    """List visible SSIDs using NetworkManager's ``nmcli`` when available."""
+    if shutil.which("nmcli") is None:
+        return []
+    output = _run_scan_command(
+        ["nmcli", "--terse", "--fields", "SSID", "dev", "wifi", "list", "--rescan", "yes"]
+    )
+    ssids: list[str] = []
+    for line in output.splitlines():
+        ssid = line.replace(r"\:", ":").replace(r"\\", "\\").strip()
+        if ssid:
+            ssids.append(ssid)
+    return ssids
 
 
 # --------------------------------------------------------------------------- #
@@ -512,6 +591,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._log_at_line_start = True
 
         self._build_ui()
+        self.refresh_ssids()
         self.refresh_ports()
         self.resize(680, 720)
 
@@ -550,12 +630,17 @@ class MainWindow(QtWidgets.QMainWindow):
         wifi_form = QtWidgets.QFormLayout(wifi_group)
         wifi_form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
 
-        self.ssid_edit = QtWidgets.QLineEdit()
-        self.ssid_edit.setMaxLength(256)  # validation is by UTF-8 byte length
+        self.ssid_edit = QtWidgets.QComboBox()
+        self.ssid_edit.setEditable(True)
+        self.ssid_edit.setInsertPolicy(QtWidgets.QComboBox.InsertPolicy.NoInsert)
+        self.ssid_edit.setDuplicatesEnabled(False)
+        self.ssid_edit.lineEdit().setMaxLength(256)  # validation is by UTF-8 byte length
         self.ssid_edit.setAccessibleName("SSID")
         self.ssid_edit.setAccessibleDescription(
-            "The exact name of your Wi-Fi network (SSID). Maximum 32 UTF-8 bytes."
+            "Choose a detected Wi-Fi network name, or type an SSID that is not "
+            "listed. Maximum 32 UTF-8 bytes."
         )
+        self.ssid_edit.lineEdit().setPlaceholderText("Choose or type a network name")
         ssid_label = QtWidgets.QLabel("&SSID (network name):")
         ssid_label.setBuddy(self.ssid_edit)
         wifi_form.addRow(ssid_label, self.ssid_edit)
@@ -631,7 +716,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Allow Enter in either text field to start provisioning, mirroring
         # the web page's form-submit behaviour.
-        self.ssid_edit.returnPressed.connect(self.start_provision)
+        self.ssid_edit.lineEdit().returnPressed.connect(self.start_provision)
         self.pass_edit.returnPressed.connect(self.start_provision)
 
         # -- Status (read-only line edit so it lives in the tab order) ----- #
@@ -718,6 +803,14 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.pass_edit.setEchoMode(mode)
 
+    def refresh_ssids(self) -> None:
+        """Populate the SSID combobox with visible networks, preserving typing."""
+        previous = self.ssid_edit.currentText()
+        self.ssid_edit.clear()
+        for ssid in list_wifi_ssids():
+            self.ssid_edit.addItem(ssid)
+        self.ssid_edit.setCurrentText(previous)
+
     def refresh_ports(self) -> None:
         """Repopulate the port combobox from the OS, preserving the selection."""
         previous = self.port_combo.currentData()
@@ -740,7 +833,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._worker is not None and self._worker.isRunning():
             return
 
-        ssid = self.ssid_edit.text().strip()
+        ssid = self.ssid_edit.currentText().strip()
         # Passwords may legitimately contain leading/trailing spaces, so
         # do not strip the password value.
         password = self.pass_edit.text()

@@ -62,7 +62,8 @@ python3 wifi_provisioner_qt.py
 
 The window contains, in tab order:
 
-1. **SSID** (`Alt+S`)
+1. **SSID** (`Alt+S`) — an editable combobox listing visible networks;
+   type a network name directly if it is not listed
 2. **Password** (`Alt+P`) — with a **Show password** toggle (`Alt+H`)
 3. **Port** combobox (`Alt+T`) and **Refresh** button (`Alt+R`)
 4. **Send to ESP32** (`Alt+D`) and **Cancel** (`Alt+C`)
