@@ -363,7 +363,7 @@ class ProvisionWorker(QThread):
             while written < len(data):
                 n = ser.write(data[written:])
                 if n == 0:
-                    raise RuntimeError("Timed out while writing to the serial port.")
+                    raise RuntimeError("Serial write returned zero bytes.")
                 written += n
         except serial.SerialTimeoutException as exc:
             raise RuntimeError("Timed out while writing to the serial port.") from exc
