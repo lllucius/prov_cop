@@ -2,7 +2,7 @@
 
 A tiny, accessible Wi-Fi provisioning system for ESP32 boards.
 
-It has two parts:
+It has three parts:
 
 1. **`index.html`** — a single self-contained web page that uses the
    [Web Serial API](https://developer.mozilla.org/docs/Web/API/Web_Serial_API)
@@ -11,7 +11,17 @@ It has two parts:
    reader (and other AT) using semantic HTML, real `<label>`s,
    `aria-live` regions, and visible focus styles.
 
-2. **`provisioner/`** — a drop-in **ESP-IDF v6** component that
+2. **`wifi_provisioner_qt.py`** — a single-module Python / Qt 6
+   (PySide6) desktop application that does the same thing without
+   needing a browser or Web Serial. It targets JAWS on Windows and is
+   accessible by keyboard alone: every control has a real label with an
+   access-key (`Alt`-mnemonic), an explicit tab order, and an
+   accessible description. Status, connected device name, and the
+   serial log are read-only edit fields so they stay in the tab order
+   and are read by screen readers. The window follows the operating
+   system light/dark theme.
+
+3. **`provisioner/`** — a drop-in **ESP-IDF v6** component that
    sits in the background watching for the provisioning protocol on a
    UART (typically the one wired to the on-board USB-serial bridge).
    When valid credentials arrive, it hands them to a callback in the
@@ -36,6 +46,36 @@ The page itself walks the user through three steps: plug in the board,
 fill in the SSID and password, then choose **Send to ESP32**. The
 browser's serial-port chooser appears, the user picks the ESP32, and the
 status region announces progress and the final result.
+
+## Using the desktop application
+
+`wifi_provisioner_qt.py` is a single-module Qt 6 application that
+implements the same flow without a browser. It is the recommended
+option for screen-reader users on Windows.
+
+Requirements (Python 3.12 or newer):
+
+```sh
+pip install -r requirements-qt.txt
+python3 wifi_provisioner_qt.py
+```
+
+The window contains, in tab order:
+
+1. **SSID** (`Alt+S`)
+2. **Password** (`Alt+P`) — with a **Show password** toggle (`Alt+H`)
+3. **Port** combobox (`Alt+T`) and **Refresh** button (`Alt+R`)
+4. **Send to ESP32** (`Alt+D`) and **Cancel** (`Alt+C`)
+5. **Status**, **Connected device**, and **Serial log** as read-only
+   text fields (so they sit in the tab order and can be reviewed and
+   copied by screen-reader users)
+6. **Clear log** (`Alt+L`)
+
+Status and device-name updates fire a Qt accessibility `Alert` event so
+JAWS announces them as they change, regardless of the focused control.
+The application palette tracks the OS light/dark color scheme via
+`QStyleHints.colorScheme()` and updates live when the system theme
+changes.
 
 ## Using the ESP32 component
 
@@ -165,6 +205,8 @@ for `<<PROV:OK>>` or `<<PROV:ERR ...>>`.
 
 ```
 index.html                                 Provisioning web page
+wifi_provisioner_qt.py                     Accessible Python / Qt 6 desktop app
+requirements-qt.txt                        Python deps for the desktop app
 provisioner/                               ESP-IDF v6 component
   CMakeLists.txt                           idf_component_register
   Kconfig                                  menuconfig defaults

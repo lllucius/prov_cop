@@ -644,6 +644,15 @@
         throw e;
       }
     }
+    // Deassert DTR and RTS immediately after opening. Many ESP32 dev boards
+    // wire these lines through an autoreset circuit (EN + BOOT pins via a
+    // capacitor), so leaving them asserted resets the chip right when we need
+    // it listening for probes. Best-effort: some browser/OS combinations do
+    // not expose setSignals(), and provisioning can still work on boards that
+    // don't use the autoreset circuit.
+    try {
+      await port.setSignals({ dataTerminalReady: false, requestToSend: false });
+    } catch (_) {}
     return port;
   }
 
@@ -974,7 +983,7 @@
       if (kind === "OK") {
         setStatus("Success. The ESP32 accepted the Wi-Fi details. Closing port...");
       } else {
-        const reason = (result[2] || "").trim() || "unknown";
+        const reason = (result[2] || "").trim() || "(no reason given)";
         // Show feedback BEFORE throwing — the surrounding finally awaits
         // closeSession() which can take a moment, and an empty/stale status
         // during that wait looks like a hang to the user.
