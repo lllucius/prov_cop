@@ -60,9 +60,9 @@ from PySide6.QtCore import Qt, QThread, Signal
 
 BAUD = 115200
 PROBE = b"<<PROV?>>\n"
-READY_RE = re.compile(rb"<<PROV!>>")
-ID_RE = re.compile(rb"<<PROV:ID\s+([A-Za-z0-9+/=]+)>>")
-RESULT_RE = re.compile(rb"<<PROV:(OK|ERR(?:\s+([^>]*))?)>>")
+READY_RE = re.compile(rb"<<PROV!>>(?:\r?\n)?")
+ID_RE = re.compile(rb"<<PROV:ID\s+([A-Za-z0-9+/=]+)>>(?:\r?\n)?")
+RESULT_RE = re.compile(rb"<<PROV:(OK|ERR)(?:\s+([^\s>\r\n]+))?>>(?:\r?\n)?")
 
 PROBE_INTERVAL_S = 0.5      # time to wait for a READY between probes
 ATTENTION_TIMEOUT_S = 8.0   # total time to wait for the first READY
@@ -330,6 +330,12 @@ class ProvisionWorker(QThread):
                     )
                     return
                 reason_b = match.group(2) or b""
+                # The current firmware never emits a bare <<PROV:ERR>> frame:
+                # provisioner_proto.c always includes a reason token (at least
+                # "fail"). If we see a reason-less ERR here, treat it as a
+                # malformed / stale frame and keep waiting for the real result.
+                if not reason_b:
+                    continue
                 reason = reason_b.decode("ascii", errors="replace").strip() or "(no reason given)"
                 raise RuntimeError(f"The ESP32 reported a failure: {reason}")
 
