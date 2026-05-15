@@ -63,6 +63,7 @@ PROBE = b"<<PROV?>>\n"
 READY_FRAME = b"<<PROV!>>"
 ID_LINE_RE = re.compile(rb"^<<PROV:ID\s+([A-Za-z0-9+/=]+)>>$")
 RESULT_LINE_RE = re.compile(rb"^<<PROV:(OK|ERR)(?:\s+([^\s>\r\n]+))?>>$")
+NO_REASON_GIVEN = "(no reason given)"
 
 PROBE_INTERVAL_S = 0.5      # time to wait for a READY between probes
 ATTENTION_TIMEOUT_S = 8.0   # total time to wait for the first READY
@@ -351,7 +352,7 @@ class ProvisionWorker(QThread):
                 # malformed / stale frame and keep waiting for the real result.
                 if not reason_b:
                     continue
-                reason = reason_b.decode("ascii", errors="replace").strip() or "(no reason given)"
+                reason = reason_b.decode("ascii", errors="replace").strip() or NO_REASON_GIVEN
                 raise RuntimeError(f"The ESP32 reported a failure: {reason}")
 
     # -- I/O primitives --------------------------------------------------------
@@ -361,7 +362,7 @@ class ProvisionWorker(QThread):
             written = 0
             while written < len(data):
                 n = ser.write(data[written:])
-                if n is None or n <= 0:
+                if n == 0:
                     raise RuntimeError("Timed out while writing to the serial port.")
                 written += n
         except serial.SerialTimeoutException as exc:
