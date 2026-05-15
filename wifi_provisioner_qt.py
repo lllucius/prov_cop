@@ -654,7 +654,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ssid_edit = QtWidgets.QComboBox()
         self.ssid_edit.setEditable(True)
         self.ssid_edit.setInsertPolicy(QtWidgets.QComboBox.InsertPolicy.NoInsert)
-        self.ssid_edit.setDuplicatesEnabled(False)
         # Keep paste mistakes bounded; start_provision enforces the 32-byte SSID limit.
         self.ssid_edit.lineEdit().setMaxLength(256)
         self.ssid_edit.setAccessibleName("SSID")
@@ -831,6 +830,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ssid_edit.clear()
         for ssid in list_wifi_ssids():
             self.ssid_edit.addItem(ssid)
+        if previous and self.ssid_edit.findText(previous, Qt.MatchFlag.MatchExactly) < 0:
+            self.ssid_edit.addItem(previous)
         self.ssid_edit.setCurrentText(previous)
 
     def refresh_ports(self) -> None:
