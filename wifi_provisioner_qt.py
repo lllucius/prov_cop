@@ -231,7 +231,7 @@ class ProvisionWorker(QThread):
             # result-wait fast-path to match them before any real data arrives.
             try:
                 ser.reset_input_buffer()
-            except Exception:  # pylint: disable=broad-except
+            except serial.SerialException:
                 pass
         except serial.SerialException as exc:
             raise RuntimeError(
@@ -292,7 +292,7 @@ class ProvisionWorker(QThread):
         buf.clear()
         try:
             ser.reset_input_buffer()
-        except Exception:  # pylint: disable=broad-except
+        except serial.SerialException:
             pass
         self.statusChanged.emit("ESP32 is ready. Sending Wi-Fi details ...")
         ssid_b64 = base64.b64encode(self._ssid.encode("utf-8")).decode("ascii")
