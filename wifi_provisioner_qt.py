@@ -45,7 +45,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 
 import serial
 from serial.tools import list_ports
@@ -60,9 +60,9 @@ from PySide6.QtCore import Qt, QThread, Signal
 
 BAUD = 115200
 PROBE = b"<<PROV?>>\n"
-READY_RE = re.compile(rb"<<PROV!>>(?:\r?\n)?")
-ID_RE = re.compile(rb"<<PROV:ID\s+([A-Za-z0-9+/=]+)>>(?:\r?\n)?")
-RESULT_RE = re.compile(rb"<<PROV:(OK|ERR)(?:\s+([^\s>\r\n]+))?>>(?:\r?\n)?")
+READY_FRAME = b"<<PROV!>>"
+ID_LINE_RE = re.compile(rb"^<<PROV:ID\s+([A-Za-z0-9+/=]+)>>$")
+RESULT_LINE_RE = re.compile(rb"^<<PROV:(OK|ERR)(?:\s+([^\s>\r\n]+))?>>$")
 
 PROBE_INTERVAL_S = 0.5      # time to wait for a READY between probes
 ATTENTION_TIMEOUT_S = 8.0   # total time to wait for the first READY
@@ -255,15 +255,20 @@ class ProvisionWorker(QThread):
         self.statusChanged.emit(
             "Connected to serial device. Trying to get the ESP32's attention ..."
         )
-        ready_match: Optional[re.Match[bytes]] = None
+        ready_seen = False
         deadline = time.monotonic() + ATTENTION_TIMEOUT_S
         while time.monotonic() < deadline:
             self._raise_if_cancelled()
             self._send(ser, PROBE)
-            ready_match = self._wait_for(ser, buf, READY_RE, PROBE_INTERVAL_S)
-            if ready_match is not None:
+            ready_seen = self._wait_for_line_match(
+                ser,
+                buf,
+                lambda line: True if line == READY_FRAME else None,
+                PROBE_INTERVAL_S,
+            )
+            if ready_seen:
                 break
-        if ready_match is None:
+        if not ready_seen:
             raise RuntimeError(
                 "The ESP32 did not respond. Check that the board is plugged "
                 "in, running the provisioning firmware, and not opened by "
@@ -273,7 +278,12 @@ class ProvisionWorker(QThread):
         # --- Optional ID frame -----------------------------------------------
         # Some firmware advertises a human-readable name immediately after
         # READY. Wait briefly for it, but do not fail if it never arrives.
-        id_match = self._wait_for(ser, buf, ID_RE, ID_GRACE_S)
+        id_match = self._wait_for_line_match(
+            ser,
+            buf,
+            lambda line: ID_LINE_RE.fullmatch(line),
+            ID_GRACE_S,
+        )
         if id_match is not None:
             try:
                 decoded = base64.b64decode(id_match.group(1), validate=True)
@@ -321,7 +331,12 @@ class ProvisionWorker(QThread):
                     f"take up to {int(RESULT_TIMEOUT_S)} s while the ESP32 "
                     f"tries to join the Wi-Fi network)"
                 )
-            match = self._wait_for(ser, buf, RESULT_RE, 0.25)
+            match = self._wait_for_line_match(
+                ser,
+                buf,
+                lambda line: RESULT_LINE_RE.fullmatch(line),
+                0.25,
+            )
             if match is not None:
                 kind = match.group(1).decode("ascii", errors="replace")
                 if kind == "OK":
@@ -342,7 +357,17 @@ class ProvisionWorker(QThread):
     # -- I/O primitives --------------------------------------------------------
     def _send(self, ser: serial.Serial, data: bytes) -> None:
         """Write raw bytes to the port and mirror them to the on-screen log."""
-        ser.write(data)
+        try:
+            written = 0
+            while written < len(data):
+                n = ser.write(data[written:])
+                if n is None or n <= 0:
+                    raise RuntimeError("Timed out while writing to the serial port.")
+                written += n
+        except serial.SerialTimeoutException as exc:
+            raise RuntimeError("Timed out while writing to the serial port.") from exc
+        except serial.SerialException as exc:
+            raise RuntimeError(f"Serial write failed: {exc}") from exc
         try:
             ser.flush()
         except Exception:  # pylint: disable=broad-except
@@ -351,24 +376,38 @@ class ProvisionWorker(QThread):
             pass
         self.logLine.emit("TX", data.decode("utf-8", errors="replace"))
 
-    def _wait_for(
+    @staticmethod
+    def _pop_line_match(
+        buf: bytearray,
+        matcher: Callable[[bytes], object | None],
+    ) -> object | None:
+        """Consume complete lines from ``buf`` until ``matcher`` returns a value."""
+        while True:
+            nl = buf.find(b"\n")
+            if nl < 0:
+                return None
+            line = bytes(buf[: nl + 1])
+            del buf[: nl + 1]
+            matched = matcher(line.rstrip(b"\r\n"))
+            if matched is not None:
+                return matched
+
+    def _wait_for_line_match(
         self,
         ser: serial.Serial,
         buf: bytearray,
-        pattern: re.Pattern[bytes],
+        matcher: Callable[[bytes], object | None],
         timeout_s: float,
-    ) -> Optional[re.Match[bytes]]:
-        """Read until ``pattern`` matches the accumulated buffer or we time out.
+    ) -> object | None:
+        """Read until ``matcher`` matches a complete line from ``buf``.
 
-        Bytes already in ``buf`` are scanned first (fast path). Newly
-        arrived bytes are appended, mirrored to the log as RX, and
-        scanned again. On a match the matched bytes (and anything before
-        them) are consumed from ``buf`` so subsequent waiters start
-        cleanly. Returns ``None`` on timeout.
+        Only newline-terminated lines are considered protocol candidates.
+        Non-matching lines are discarded so incidental console chatter does
+        not block or confuse the provisioning state machine. Returns
+        ``None`` on timeout.
         """
-        match = pattern.search(buf)
+        match = self._pop_line_match(buf, matcher)
         if match is not None:
-            del buf[: match.end()]
             return match
 
         end = time.monotonic() + timeout_s
@@ -383,9 +422,8 @@ class ProvisionWorker(QThread):
                 # tail to match any in-flight frame.
                 del buf[: len(buf) - SERIAL_BUFFER_TRIM]
             self.logLine.emit("RX", chunk.decode("utf-8", errors="replace"))
-            match = pattern.search(buf)
+            match = self._pop_line_match(buf, matcher)
             if match is not None:
-                del buf[: match.end()]
                 return match
         return None
 
