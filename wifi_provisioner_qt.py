@@ -64,7 +64,7 @@ from PySide6.QtCore import Qt, QThread, Signal
 BAUD = 115200
 PROBE = b"<<PROV?>>\n"
 READY_FRAME = b"<<PROV!>>"
-READY_RE = re.compile(re.escape(READY_FRAME))
+READY_RE = re.compile(rb"<<PROV!>>")
 ID_RE = re.compile(rb"<<PROV:ID\s+([A-Za-z0-9+/=]+)>>")
 RESULT_RE = re.compile(rb"<<PROV:(OK|ERR)(?:\s+([^\r\n]*?))?>>")
 NO_REASON_GIVEN = "(no reason given)"
@@ -159,7 +159,13 @@ def list_wifi_ssids() -> list[str]:
         ssids = _scan_macos_ssids()
     else:
         ssids = _scan_linux_ssids()
-    return sorted({ssid for ssid in ssids if ssid}, key=str.casefold)
+    seen: set[str] = set()
+    unique = []
+    for ssid in ssids:
+        if ssid and ssid not in seen:
+            seen.add(ssid)
+            unique.append(ssid)
+    return sorted(unique, key=str.casefold)
 
 
 def _run_scan_command(args: list[str]) -> str:
@@ -655,7 +661,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ssid_edit.setEditable(True)
         self.ssid_edit.setInsertPolicy(QtWidgets.QComboBox.InsertPolicy.NoInsert)
         # Qt counts characters, not UTF-8 bytes; keep paste mistakes bounded
-        # while start_provision enforces the real 32-byte SSID limit.
+        # while start_provision() below enforces the real 32-byte SSID limit.
         self.ssid_edit.lineEdit().setMaxLength(256)
         self.ssid_edit.setAccessibleName("SSID")
         self.ssid_edit.setAccessibleDescription(
@@ -831,10 +837,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ssid_edit.clear()
         for ssid in list_wifi_ssids():
             self.ssid_edit.addItem(ssid)
-        already_listed = any(
-            self.ssid_edit.itemText(i) == previous
-            for i in range(self.ssid_edit.count())
-        )
+        already_listed = self.ssid_edit.findText(previous, Qt.MatchFlag.MatchExactly) >= 0
         if previous and not already_listed:
             self.ssid_edit.addItem(previous)
         self.ssid_edit.setCurrentText(previous)
