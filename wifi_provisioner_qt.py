@@ -40,7 +40,10 @@ Run with::
 from __future__ import annotations
 
 import base64
+import os
 import re
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -61,8 +64,9 @@ from PySide6.QtCore import Qt, QThread, Signal
 BAUD = 115200
 PROBE = b"<<PROV?>>\n"
 READY_FRAME = b"<<PROV!>>"
-ID_LINE_RE = re.compile(rb"^<<PROV:ID\s+([A-Za-z0-9+/=]+)>>$")
-RESULT_LINE_RE = re.compile(rb"^<<PROV:(OK|ERR)(?:\s+([^\s>\r\n]+))?>>$")
+READY_RE = re.compile(rb"<<PROV!>>")
+ID_RE = re.compile(rb"<<PROV:ID\s+([A-Za-z0-9+/=]+)>>")
+RESULT_RE = re.compile(rb"<<PROV:(OK|ERR)(?:\s+([^\r\n]*?))?>>")
 NO_REASON_GIVEN = "(no reason given)"
 
 PROBE_INTERVAL_S = 0.5      # time to wait for a READY between probes
@@ -145,6 +149,109 @@ def list_serial_ports() -> list[PortInfo]:
     ports = [PortInfo(p.device, p.description or "") for p in list_ports.comports()]
     ports.sort(key=lambda p: p.device)
     return ports
+
+
+def list_wifi_ssids() -> list[str]:
+    """Return visible Wi-Fi network names, best-effort and de-duplicated."""
+    if sys.platform.startswith("win"):
+        ssids = _scan_windows_ssids()
+    elif sys.platform == "darwin":
+        ssids = _scan_macos_ssids()
+    else:
+        ssids = _scan_linux_ssids()
+    seen: set[str] = set()
+    unique = []
+    for ssid in ssids:
+        if ssid and ssid not in seen:
+            seen.add(ssid)
+            unique.append(ssid)
+    return sorted(unique, key=str.casefold)
+
+
+def _run_scan_command(args: list[str]) -> str:
+    """Run an OS Wi-Fi scan command and return stdout.
+
+    Returns ``""`` when the command is unavailable, times out, cannot be
+    launched, or exits with a non-zero status.
+    """
+    try:
+        proc = subprocess.run(
+            args,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return proc.stdout
+
+
+def _scan_windows_ssids() -> list[str]:
+    """List visible SSIDs using Windows ``netsh``."""
+    if shutil.which("netsh") is None:
+        return []
+    output = _run_scan_command(["netsh", "wlan", "show", "networks", "mode=bssid"])
+    ssids: list[str] = []
+    for line in output.splitlines():
+        match = re.match(r"\s*SSID\s+\d+\s*:\s*(.*?)\s*$", line)
+        if match:
+            ssids.append(match.group(1))
+    return ssids
+
+
+def _scan_macos_ssids() -> list[str]:
+    """List visible SSIDs using macOS's airport scanner."""
+    airport = (
+        "/System/Library/PrivateFrameworks/Apple80211.framework"
+        "/Versions/Current/Resources/airport"
+    )
+    if not os.path.exists(airport):
+        return []
+    output = _run_scan_command([airport, "-s"])
+    ssids: list[str] = []
+    bssid_re = re.compile(r"\s+(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}\s+")
+    for line in output.splitlines()[1:]:
+        match = bssid_re.search(line)
+        if match:
+            ssids.append(line[: match.start()].strip())
+    return ssids
+
+
+def _scan_linux_ssids() -> list[str]:
+    """List visible SSIDs using NetworkManager's ``nmcli`` when available."""
+    if shutil.which("nmcli") is None:
+        return []
+    output = _run_scan_command(
+        ["nmcli", "--terse", "--fields", "SSID", "dev", "wifi", "list", "--rescan", "no"]
+    )
+    ssids: list[str] = []
+    for line in output.splitlines():
+        ssid = _unescape_nmcli_field(line)
+        if ssid:
+            ssids.append(ssid)
+    return ssids
+
+
+def _unescape_nmcli_field(text: str) -> str:
+    """Decode backslash escapes used by ``nmcli --terse`` fields."""
+    chars: list[str] = []
+    escaped = False
+    for ch in text:
+        if escaped:
+            chars.append(ch)
+            escaped = False
+        elif ch == "\\":
+            escaped = True
+        else:
+            chars.append(ch)
+    if escaped:
+        chars.append("\\")
+    return "".join(chars).strip()
 
 
 # --------------------------------------------------------------------------- #
@@ -261,10 +368,10 @@ class ProvisionWorker(QThread):
         while time.monotonic() < deadline:
             self._raise_if_cancelled()
             self._send(ser, PROBE)
-            ready_seen = self._wait_for_line_match(
+            ready_seen = self._wait_for_buffer_match(
                 ser,
                 buf,
-                lambda line: True if line == READY_FRAME else None,
+                READY_RE.search,
                 PROBE_INTERVAL_S,
             )
             if ready_seen:
@@ -279,10 +386,10 @@ class ProvisionWorker(QThread):
         # --- Optional ID frame -----------------------------------------------
         # Some firmware advertises a human-readable name immediately after
         # READY. Wait briefly for it, but do not fail if it never arrives.
-        id_match = self._wait_for_line_match(
+        id_match = self._wait_for_buffer_match(
             ser,
             buf,
-            lambda line: ID_LINE_RE.fullmatch(line),
+            ID_RE.search,
             ID_GRACE_S,
         )
         if id_match is not None:
@@ -332,10 +439,10 @@ class ProvisionWorker(QThread):
                     f"take up to {int(RESULT_TIMEOUT_S)} s while the ESP32 "
                     f"tries to join the Wi-Fi network)"
                 )
-            match = self._wait_for_line_match(
+            match = self._wait_for_buffer_match(
                 ser,
                 buf,
-                lambda line: RESULT_LINE_RE.fullmatch(line),
+                RESULT_RE.search,
                 0.25,
             )
             if match is not None:
@@ -378,36 +485,33 @@ class ProvisionWorker(QThread):
         self.logLine.emit("TX", data.decode("utf-8", errors="replace"))
 
     @staticmethod
-    def _pop_line_match(
+    def _pop_buffer_match(
         buf: bytearray,
-        matcher: Callable[[bytes], object | None],
-    ) -> object | None:
-        """Consume complete lines from ``buf`` until ``matcher`` returns a value."""
-        while True:
-            nl = buf.find(b"\n")
-            if nl < 0:
-                return None
-            line = bytes(buf[: nl + 1])
-            del buf[: nl + 1]
-            matched = matcher(line.rstrip(b"\r\n"))
-            if matched is not None:
-                return matched
+        matcher: Callable[[bytes], re.Match[bytes] | None],
+    ) -> re.Match[bytes] | None:
+        """Consume bytes from ``buf`` through the first matching frame."""
+        matched = matcher(bytes(buf))
+        if matched is None:
+            return None
+        del buf[: matched.end()]
+        return matched
 
-    def _wait_for_line_match(
+    def _wait_for_buffer_match(
         self,
         ser: serial.Serial,
         buf: bytearray,
-        matcher: Callable[[bytes], object | None],
+        matcher: Callable[[bytes], re.Match[bytes] | None],
         timeout_s: float,
-    ) -> object | None:
-        """Read until ``matcher`` matches a complete line from ``buf``.
+    ) -> re.Match[bytes] | None:
+        """Read until ``matcher`` matches a frame anywhere in ``buf``.
 
-        Only newline-terminated lines are considered protocol candidates.
-        Non-matching lines are discarded so incidental console chatter does
-        not block or confuse the provisioning state machine. Returns
-        ``None`` on timeout.
+        Mirrors ``index.html`` by searching the whole accumulated RX buffer
+        instead of waiting for newline-terminated lines. Non-matching bytes
+        ahead of the frame are discarded only once a full frame is found, so
+        incidental console chatter and split serial chunks do not block the
+        provisioning state machine. Returns ``None`` on timeout.
         """
-        match = self._pop_line_match(buf, matcher)
+        match = self._pop_buffer_match(buf, matcher)
         if match is not None:
             return match
 
@@ -423,7 +527,7 @@ class ProvisionWorker(QThread):
                 # tail to match any in-flight frame.
                 del buf[: len(buf) - SERIAL_BUFFER_TRIM]
             self.logLine.emit("RX", chunk.decode("utf-8", errors="replace"))
-            match = self._pop_line_match(buf, matcher)
+            match = self._pop_buffer_match(buf, matcher)
             if match is not None:
                 return match
         return None
@@ -514,6 +618,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._log_at_line_start = True
 
         self._build_ui()
+        self.refresh_ssids()
         self.refresh_ports()
         self.resize(680, 720)
 
@@ -552,12 +657,17 @@ class MainWindow(QtWidgets.QMainWindow):
         wifi_form = QtWidgets.QFormLayout(wifi_group)
         wifi_form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
 
-        self.ssid_edit = QtWidgets.QLineEdit()
-        self.ssid_edit.setMaxLength(256)  # validation is by UTF-8 byte length
+        self.ssid_edit = QtWidgets.QComboBox()
+        self.ssid_edit.setEditable(True)
+        self.ssid_edit.setInsertPolicy(QtWidgets.QComboBox.InsertPolicy.NoInsert)
+        # Qt counts characters, not UTF-8 bytes; keep paste mistakes bounded.
+        self.ssid_edit.lineEdit().setMaxLength(256)
         self.ssid_edit.setAccessibleName("SSID")
         self.ssid_edit.setAccessibleDescription(
-            "The exact name of your Wi-Fi network (SSID). Maximum 32 UTF-8 bytes."
+            "Choose a detected Wi-Fi network name, or type an SSID that is not "
+            "listed. Maximum 32 UTF-8 bytes."
         )
+        self.ssid_edit.lineEdit().setPlaceholderText("Choose or type a network name")
         ssid_label = QtWidgets.QLabel("&SSID (network name):")
         ssid_label.setBuddy(self.ssid_edit)
         wifi_form.addRow(ssid_label, self.ssid_edit)
@@ -633,7 +743,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Allow Enter in either text field to start provisioning, mirroring
         # the web page's form-submit behaviour.
-        self.ssid_edit.returnPressed.connect(self.start_provision)
+        self.ssid_edit.lineEdit().returnPressed.connect(self.start_provision)
         self.pass_edit.returnPressed.connect(self.start_provision)
 
         # -- Status (read-only line edit so it lives in the tab order) ----- #
@@ -720,6 +830,19 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.pass_edit.setEchoMode(mode)
 
+    def refresh_ssids(self) -> None:
+        """Populate the SSID combobox with visible networks, preserving typing."""
+        previous = self.ssid_edit.currentText()
+        self.ssid_edit.clear()
+        for ssid in list_wifi_ssids():
+            self.ssid_edit.addItem(ssid)
+        # If a custom SSID is later reported by a scan, findText prevents a
+        # duplicate while still preserving typed names that are not visible.
+        already_listed = self.ssid_edit.findText(previous, Qt.MatchFlag.MatchExactly) >= 0
+        if previous and not already_listed:
+            self.ssid_edit.addItem(previous)
+        self.ssid_edit.setCurrentText(previous)
+
     def refresh_ports(self) -> None:
         """Repopulate the port combobox from the OS, preserving the selection."""
         previous = self.port_combo.currentData()
@@ -742,7 +865,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._worker is not None and self._worker.isRunning():
             return
 
-        ssid = self.ssid_edit.text().strip()
+        ssid = self.ssid_edit.currentText().strip()
         # Passwords may legitimately contain leading/trailing spaces, so
         # do not strip the password value.
         password = self.pass_edit.text()
