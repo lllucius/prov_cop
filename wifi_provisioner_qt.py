@@ -221,7 +221,7 @@ def _scan_linux_ssids() -> list[str]:
     )
     ssids: list[str] = []
     for line in output.splitlines():
-        ssid = line.replace(r"\:", ":").replace(r"\\", "\\").strip()
+        ssid = line.replace("\\:", ":").replace("\\\\", "\\").strip()
         if ssid:
             ssids.append(ssid)
     return ssids
@@ -634,7 +634,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ssid_edit.setEditable(True)
         self.ssid_edit.setInsertPolicy(QtWidgets.QComboBox.InsertPolicy.NoInsert)
         self.ssid_edit.setDuplicatesEnabled(False)
-        self.ssid_edit.lineEdit().setMaxLength(256)  # validation is by UTF-8 byte length
+        # Keep the UI bounded; start_provision validates the UTF-8 byte length.
+        self.ssid_edit.lineEdit().setMaxLength(256)
         self.ssid_edit.setAccessibleName("SSID")
         self.ssid_edit.setAccessibleDescription(
             "Choose a detected Wi-Fi network name, or type an SSID that is not "
