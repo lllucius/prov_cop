@@ -163,7 +163,11 @@ def list_wifi_ssids() -> list[str]:
 
 
 def _run_scan_command(args: list[str]) -> str:
-    """Run an OS Wi-Fi scan command and return stdout, or ``""`` on failure."""
+    """Run an OS Wi-Fi scan command and return stdout.
+
+    Returns ``""`` when the command is unavailable, times out, cannot be
+    launched, or exits with a non-zero status.
+    """
     try:
         proc = subprocess.run(
             args,
@@ -188,7 +192,7 @@ def _scan_windows_ssids() -> list[str]:
     output = _run_scan_command(["netsh", "wlan", "show", "networks", "mode=bssid"])
     ssids: list[str] = []
     for line in output.splitlines():
-        match = re.match(r"\s*SSID\s+\d+\s*:\s*(.*)\s*$", line)
+        match = re.match(r"\s*SSID\s+\d+\s*:\s*(.*?)\s*$", line)
         if match:
             ssids.append(match.group(1).strip())
     return ssids
@@ -221,10 +225,27 @@ def _scan_linux_ssids() -> list[str]:
     )
     ssids: list[str] = []
     for line in output.splitlines():
-        ssid = line.replace("\\:", ":").replace("\\\\", "\\").strip()
+        ssid = _unescape_nmcli_field(line).strip()
         if ssid:
             ssids.append(ssid)
     return ssids
+
+
+def _unescape_nmcli_field(text: str) -> str:
+    """Decode backslash escapes used by ``nmcli --terse`` fields."""
+    chars: list[str] = []
+    escaped = False
+    for ch in text:
+        if escaped:
+            chars.append(ch)
+            escaped = False
+        elif ch == "\\":
+            escaped = True
+        else:
+            chars.append(ch)
+    if escaped:
+        chars.append("\\")
+    return "".join(chars)
 
 
 # --------------------------------------------------------------------------- #
