@@ -227,7 +227,7 @@ def _scan_linux_ssids() -> list[str]:
     if shutil.which("nmcli") is None:
         return []
     output = _run_scan_command(
-        ["nmcli", "--terse", "--fields", "SSID", "dev", "wifi", "list", "--rescan", "auto"]
+        ["nmcli", "--terse", "--fields", "SSID", "dev", "wifi", "list", "--rescan", "no"]
     )
     ssids: list[str] = []
     for line in output.splitlines():
@@ -660,8 +660,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ssid_edit = QtWidgets.QComboBox()
         self.ssid_edit.setEditable(True)
         self.ssid_edit.setInsertPolicy(QtWidgets.QComboBox.InsertPolicy.NoInsert)
-        # Qt counts characters, not UTF-8 bytes; keep paste mistakes bounded
-        # while start_provision() below enforces the real 32-byte SSID limit.
+        # Qt counts characters, not UTF-8 bytes; keep paste mistakes bounded.
         self.ssid_edit.lineEdit().setMaxLength(256)
         self.ssid_edit.setAccessibleName("SSID")
         self.ssid_edit.setAccessibleDescription(
@@ -837,6 +836,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ssid_edit.clear()
         for ssid in list_wifi_ssids():
             self.ssid_edit.addItem(ssid)
+        # If a custom SSID is later reported by a scan, findText prevents a
+        # duplicate while still preserving typed names that are not visible.
         already_listed = self.ssid_edit.findText(previous, Qt.MatchFlag.MatchExactly) >= 0
         if previous and not already_listed:
             self.ssid_edit.addItem(previous)
