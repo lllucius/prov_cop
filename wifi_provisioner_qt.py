@@ -61,8 +61,9 @@ from PySide6.QtCore import Qt, QThread, Signal
 BAUD = 115200
 PROBE = b"<<PROV?>>\n"
 READY_FRAME = b"<<PROV!>>"
-ID_LINE_RE = re.compile(rb"^<<PROV:ID\s+([A-Za-z0-9+/=]+)>>$")
-RESULT_LINE_RE = re.compile(rb"^<<PROV:(OK|ERR)(?:\s+([^\s>\r\n]+))?>>$")
+READY_RE = re.compile(re.escape(READY_FRAME))
+ID_RE = re.compile(rb"<<PROV:ID\s+([A-Za-z0-9+/=]+)>>")
+RESULT_RE = re.compile(rb"<<PROV:(OK|ERR)(?:\s+([^>]*))?>>")
 NO_REASON_GIVEN = "(no reason given)"
 
 PROBE_INTERVAL_S = 0.5      # time to wait for a READY between probes
@@ -261,10 +262,10 @@ class ProvisionWorker(QThread):
         while time.monotonic() < deadline:
             self._raise_if_cancelled()
             self._send(ser, PROBE)
-            ready_seen = self._wait_for_line_match(
+            ready_seen = self._wait_for_buffer_match(
                 ser,
                 buf,
-                lambda line: True if line == READY_FRAME else None,
+                READY_RE.search,
                 PROBE_INTERVAL_S,
             )
             if ready_seen:
@@ -279,10 +280,10 @@ class ProvisionWorker(QThread):
         # --- Optional ID frame -----------------------------------------------
         # Some firmware advertises a human-readable name immediately after
         # READY. Wait briefly for it, but do not fail if it never arrives.
-        id_match = self._wait_for_line_match(
+        id_match = self._wait_for_buffer_match(
             ser,
             buf,
-            lambda line: ID_LINE_RE.fullmatch(line),
+            ID_RE.search,
             ID_GRACE_S,
         )
         if id_match is not None:
@@ -332,10 +333,10 @@ class ProvisionWorker(QThread):
                     f"take up to {int(RESULT_TIMEOUT_S)} s while the ESP32 "
                     f"tries to join the Wi-Fi network)"
                 )
-            match = self._wait_for_line_match(
+            match = self._wait_for_buffer_match(
                 ser,
                 buf,
-                lambda line: RESULT_LINE_RE.fullmatch(line),
+                RESULT_RE.search,
                 0.25,
             )
             if match is not None:
@@ -378,36 +379,33 @@ class ProvisionWorker(QThread):
         self.logLine.emit("TX", data.decode("utf-8", errors="replace"))
 
     @staticmethod
-    def _pop_line_match(
+    def _pop_buffer_match(
         buf: bytearray,
-        matcher: Callable[[bytes], object | None],
-    ) -> object | None:
-        """Consume complete lines from ``buf`` until ``matcher`` returns a value."""
-        while True:
-            nl = buf.find(b"\n")
-            if nl < 0:
-                return None
-            line = bytes(buf[: nl + 1])
-            del buf[: nl + 1]
-            matched = matcher(line.rstrip(b"\r\n"))
-            if matched is not None:
-                return matched
+        matcher: Callable[[bytes], re.Match[bytes] | None],
+    ) -> re.Match[bytes] | None:
+        """Consume bytes from ``buf`` through the first matching frame."""
+        matched = matcher(bytes(buf))
+        if matched is None:
+            return None
+        del buf[: matched.end()]
+        return matched
 
-    def _wait_for_line_match(
+    def _wait_for_buffer_match(
         self,
         ser: serial.Serial,
         buf: bytearray,
-        matcher: Callable[[bytes], object | None],
+        matcher: Callable[[bytes], re.Match[bytes] | None],
         timeout_s: float,
-    ) -> object | None:
-        """Read until ``matcher`` matches a complete line from ``buf``.
+    ) -> re.Match[bytes] | None:
+        """Read until ``matcher`` matches a frame anywhere in ``buf``.
 
-        Only newline-terminated lines are considered protocol candidates.
-        Non-matching lines are discarded so incidental console chatter does
-        not block or confuse the provisioning state machine. Returns
-        ``None`` on timeout.
+        Mirrors ``index.html`` by searching the whole accumulated RX buffer
+        instead of waiting for newline-terminated lines. Non-matching bytes
+        ahead of the frame are discarded only once a full frame is found, so
+        incidental console chatter and split serial chunks do not block the
+        provisioning state machine. Returns ``None`` on timeout.
         """
-        match = self._pop_line_match(buf, matcher)
+        match = self._pop_buffer_match(buf, matcher)
         if match is not None:
             return match
 
@@ -423,7 +421,7 @@ class ProvisionWorker(QThread):
                 # tail to match any in-flight frame.
                 del buf[: len(buf) - SERIAL_BUFFER_TRIM]
             self.logLine.emit("RX", chunk.decode("utf-8", errors="replace"))
-            match = self._pop_line_match(buf, matcher)
+            match = self._pop_buffer_match(buf, matcher)
             if match is not None:
                 return match
         return None
