@@ -208,14 +208,21 @@ class ProvisionWorker(QThread):
         self.statusChanged.emit(f"Opening serial port {self._port_name} ...")
         try:
             ser = serial.Serial(
-                self._port_name,
-                BAUD,
+                baudrate=BAUD,
                 bytesize=serial.EIGHTBITS,
                 parity=serial.PARITY_NONE,
                 stopbits=serial.STOPBITS_ONE,
                 timeout=0.1,
                 write_timeout=2.0,
             )
+            # Deassert DTR and RTS before opening. pyserial applies these
+            # states at open() time, so setting them here prevents the brief
+            # assertion that would otherwise trigger the ESP32 autoreset
+            # circuit wired to the DTR/RTS lines on most dev boards.
+            ser.dtr = False
+            ser.rts = False
+            ser.port = self._port_name
+            ser.open()
         except serial.SerialException as exc:
             raise RuntimeError(
                 f"Could not open serial port {self._port_name}: {exc}"
@@ -304,7 +311,7 @@ class ProvisionWorker(QThread):
                     )
                     return
                 reason_b = match.group(2) or b""
-                reason = reason_b.decode("ascii", errors="replace").strip() or "unknown"
+                reason = reason_b.decode("ascii", errors="replace").strip() or "(no reason given)"
                 raise RuntimeError(f"The ESP32 reported a failure: {reason}")
 
     # -- I/O primitives --------------------------------------------------------
