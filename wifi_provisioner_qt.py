@@ -66,7 +66,7 @@ PROBE = b"<<PROV?>>\n"
 READY_FRAME = b"<<PROV!>>"
 READY_RE = re.compile(re.escape(READY_FRAME))
 ID_RE = re.compile(rb"<<PROV:ID\s+([A-Za-z0-9+/=]+)>>")
-RESULT_RE = re.compile(rb"<<PROV:(OK|ERR)(?:\s+([^>\r\n]*))?>>")
+RESULT_RE = re.compile(rb"<<PROV:(OK|ERR)(?:\s+([^\r\n]*?))?>>")
 NO_REASON_GIVEN = "(no reason given)"
 
 PROBE_INTERVAL_S = 0.5      # time to wait for a READY between probes
@@ -221,7 +221,7 @@ def _scan_linux_ssids() -> list[str]:
     if shutil.which("nmcli") is None:
         return []
     output = _run_scan_command(
-        ["nmcli", "--terse", "--fields", "SSID", "dev", "wifi", "list", "--rescan", "yes"]
+        ["nmcli", "--terse", "--fields", "SSID", "dev", "wifi", "list", "--rescan", "auto"]
     )
     ssids: list[str] = []
     for line in output.splitlines():
@@ -654,7 +654,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ssid_edit = QtWidgets.QComboBox()
         self.ssid_edit.setEditable(True)
         self.ssid_edit.setInsertPolicy(QtWidgets.QComboBox.InsertPolicy.NoInsert)
-        # Keep paste mistakes bounded; start_provision enforces the 32-byte SSID limit.
+        # Qt counts characters, not UTF-8 bytes; keep paste mistakes bounded
+        # while start_provision enforces the real 32-byte SSID limit.
         self.ssid_edit.lineEdit().setMaxLength(256)
         self.ssid_edit.setAccessibleName("SSID")
         self.ssid_edit.setAccessibleDescription(
@@ -830,7 +831,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ssid_edit.clear()
         for ssid in list_wifi_ssids():
             self.ssid_edit.addItem(ssid)
-        if previous and self.ssid_edit.findText(previous, Qt.MatchFlag.MatchExactly) < 0:
+        already_listed = any(
+            self.ssid_edit.itemText(i) == previous
+            for i in range(self.ssid_edit.count())
+        )
+        if previous and not already_listed:
             self.ssid_edit.addItem(previous)
         self.ssid_edit.setCurrentText(previous)
 
