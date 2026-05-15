@@ -194,7 +194,7 @@ def _scan_windows_ssids() -> list[str]:
     for line in output.splitlines():
         match = re.match(r"\s*SSID\s+\d+\s*:\s*(.*?)\s*$", line)
         if match:
-            ssids.append(match.group(1).strip())
+            ssids.append(match.group(1))
     return ssids
 
 
@@ -225,7 +225,7 @@ def _scan_linux_ssids() -> list[str]:
     )
     ssids: list[str] = []
     for line in output.splitlines():
-        ssid = _unescape_nmcli_field(line).strip()
+        ssid = _unescape_nmcli_field(line)
         if ssid:
             ssids.append(ssid)
     return ssids
@@ -245,7 +245,7 @@ def _unescape_nmcli_field(text: str) -> str:
             chars.append(ch)
     if escaped:
         chars.append("\\")
-    return "".join(chars)
+    return "".join(chars).strip()
 
 
 # --------------------------------------------------------------------------- #
@@ -655,7 +655,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ssid_edit.setEditable(True)
         self.ssid_edit.setInsertPolicy(QtWidgets.QComboBox.InsertPolicy.NoInsert)
         self.ssid_edit.setDuplicatesEnabled(False)
-        # Keep the UI bounded; start_provision validates the UTF-8 byte length.
+        # Keep paste mistakes bounded; start_provision enforces the 32-byte SSID limit.
         self.ssid_edit.lineEdit().setMaxLength(256)
         self.ssid_edit.setAccessibleName("SSID")
         self.ssid_edit.setAccessibleDescription(
