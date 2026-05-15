@@ -63,7 +63,7 @@ PROBE = b"<<PROV?>>\n"
 READY_FRAME = b"<<PROV!>>"
 READY_RE = re.compile(re.escape(READY_FRAME))
 ID_RE = re.compile(rb"<<PROV:ID\s+([A-Za-z0-9+/=]+)>>")
-RESULT_RE = re.compile(rb"<<PROV:(OK|ERR)(?:\s+([^>]*))?>>")
+RESULT_RE = re.compile(rb"<<PROV:(OK|ERR)(?:\s+([^>\r\n]*))?>>")
 NO_REASON_GIVEN = "(no reason given)"
 
 PROBE_INTERVAL_S = 0.5      # time to wait for a READY between probes
